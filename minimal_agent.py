@@ -8,6 +8,8 @@ Run:
 """
 
 import json
+import subprocess
+from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -17,24 +19,64 @@ MODEL = "claude-sonnet-4-6"
 
 TOOLS = [
     {
-        "name": "get_weather",
-        "description": "Get the current weather for a given city.",
+        "name": "run_shell",
+        "description": "Run a shell command and return stdout, stderr, and exit code.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "city": {"type": "string", "description": "City name, e.g. 'Taipei'"},
+                "command": {"type": "string", "description": "Shell command to execute"},
             },
-            "required": ["city"],
+            "required": ["command"],
         },
-    }
+    },
+    {
+        "name": "read_file",
+        "description": "Read the contents of a text file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to read"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write text content to a file, overwriting any existing content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to write"},
+                "content": {"type": "string", "description": "Text content to write"},
+            },
+            "required": ["path", "content"],
+        },
+    },
 ]
 
 
 def execute_tool(name: str, args: dict) -> str:
     """Dispatch table for tool execution. Return a string result."""
-    if name == "get_weather":
-        # Mock — swap with a real API call when you're ready.
-        return json.dumps({"city": args["city"], "temp_c": 22, "condition": "sunny"})
+    if name == "run_shell":
+        proc = subprocess.run(
+            args["command"], shell=True, capture_output=True, text=True, timeout=30
+        )
+        return json.dumps({
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "returncode": proc.returncode,
+        })
+    if name == "read_file":
+        try:
+            return Path(args["path"]).read_text(encoding="utf-8")
+        except Exception as e:
+            return f"ERROR reading {args['path']}: {e}"
+    if name == "write_file":
+        try:
+            Path(args["path"]).write_text(args["content"], encoding="utf-8")
+            return f"Wrote {len(args['content'])} chars to {args['path']}"
+        except Exception as e:
+            return f"ERROR writing {args['path']}: {e}"
     return f"ERROR: unknown tool {name}"
 
 
@@ -48,7 +90,7 @@ def run_agent(user_message: str, max_turns: int = 10) -> str:
     messages = [{"role": "user", "content": user_message}]
 
     for turn in range(max_turns):
-        print(f"turn: {turn}, messages:{messages}");
+        #print(f"turn: {turn}, messages:{messages}");
         response = client.messages.create(
             model=MODEL,
             max_tokens=1024,
@@ -59,7 +101,6 @@ def run_agent(user_message: str, max_turns: int = 10) -> str:
         # Always append the assistant turn verbatim — the API requires it
         # because tool_use ids must be matched in the next user turn.
         messages.append({"role": "assistant", "content": response.content})
-        print(f"turn: {turn}, messages:{messages}");
 
         if response.stop_reason == "end_turn":
             # Final text answer — collect and return.
@@ -89,6 +130,8 @@ def run_agent(user_message: str, max_turns: int = 10) -> str:
 
 
 if __name__ == "__main__":
-    answer = run_agent("What's the weather like in Taipei right now?")
+    answer = run_agent(
+        "List the Python files in the current directory, then summarize what minimal_agent.py does."
+    )
     print("\n=== Final answer ===")
     print(answer)
