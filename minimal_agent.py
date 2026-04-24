@@ -1,5 +1,5 @@
 """
-Minimal agent loop — Anthropic SDK + native tools + MCP server.
+Minimal agent loop — Anthropic SDK + native tools + MCP server, multi-turn.
 
 Run:
     pip install anthropic python-dotenv mcp mcp-server-fetch
@@ -18,7 +18,6 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 load_dotenv()
-client = Anthropic()
 MODEL = "claude-sonnet-4-6"
 
 NATIVE_TOOLS = [
@@ -95,52 +94,72 @@ async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
     return "\n".join(parts) if parts else ""
 
 
-async def run_agent(
-    session: ClientSession,
-    tools: list,
-    mcp_tool_names: set,
-    user_message: str,
-    max_turns: int = 10,
-) -> str:
-    messages = [{"role": "user", "content": user_message}]
+class Agent:
+    """Multi-turn agent. Keeps message history across chat() calls."""
 
-    for turn in range(max_turns):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            tools=tools,
-            messages=messages,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+    def __init__(
+        self,
+        client: Anthropic,
+        session: ClientSession,
+        tools: list,
+        mcp_tool_names: set,
+        model: str = MODEL,
+        max_turns: int = 10,
+    ):
+        self.client = client
+        self.session = session
+        self.tools = tools
+        self.mcp_tool_names = mcp_tool_names
+        self.model = model
+        self.max_turns = max_turns
+        self.messages: list = []
 
-        if response.stop_reason == "end_turn":
-            return "".join(
-                block.text for block in response.content if block.type == "text"
+    async def _dispatch_tool(self, name: str, args: dict) -> str:
+        if name in self.mcp_tool_names:
+            return await call_mcp_tool(self.session, name, args)
+        return execute_native_tool(name, args)
+
+    async def chat(self, user_message: str) -> str:
+        """Send one user message, run the tool-use loop, return the final reply."""
+        self.messages.append({"role": "user", "content": user_message})
+
+        for _ in range(self.max_turns):
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                tools=self.tools,
+                messages=self.messages,
             )
+            self.messages.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    source = "mcp" if block.name in mcp_tool_names else "native"
-                    print(f"  [{source}] {block.name}({block.input})")
-                    if block.name in mcp_tool_names:
-                        result = await call_mcp_tool(session, block.name, block.input)
-                    else:
-                        result = execute_native_tool(block.name, block.input)
-                    preview = result[:200] + ("..." if len(result) > 200 else "")
-                    print(f"  [result] {preview}")
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-            messages.append({"role": "user", "content": tool_results})
-            continue
+            if response.stop_reason == "end_turn":
+                return "".join(
+                    b.text for b in response.content if b.type == "text"
+                )
 
-        raise RuntimeError(f"Unexpected stop_reason: {response.stop_reason}")
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        source = "mcp" if block.name in self.mcp_tool_names else "native"
+                        print(f"  [{source}] {block.name}({block.input})")
+                        result = await self._dispatch_tool(block.name, block.input)
+                        preview = result[:200] + ("..." if len(result) > 200 else "")
+                        print(f"  [result] {preview}")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+                self.messages.append({"role": "user", "content": tool_results})
+                continue
 
-    raise RuntimeError(f"Agent exceeded {max_turns} turns")
+            raise RuntimeError(f"Unexpected stop_reason: {response.stop_reason}")
+
+        raise RuntimeError(f"Agent exceeded {self.max_turns} turns")
+
+    def reset(self):
+        self.messages = []
 
 
 async def main():
@@ -164,16 +183,33 @@ async def main():
             all_tools = NATIVE_TOOLS + mcp_tools
 
             print(f"[init] native tools: {[t['name'] for t in NATIVE_TOOLS]}")
-            print(f"[init] mcp tools:    {sorted(mcp_tool_names)}\n")
+            print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
+            print("[hint] type /reset to clear history, /exit or Ctrl-D to quit.\n")
 
-            answer = await run_agent(
-                session,
-                all_tools,
-                mcp_tool_names,
-                "Fetch https://modelcontextprotocol.io and tell me what MCP is in 2 sentences.",
+            agent = Agent(
+                client=Anthropic(),
+                session=session,
+                tools=all_tools,
+                mcp_tool_names=mcp_tool_names,
             )
-            print("\n=== Final answer ===")
-            print(answer)
+
+            while True:
+                try:
+                    user_in = (await asyncio.to_thread(input, "you> ")).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if not user_in:
+                    continue
+                if user_in in ("/exit", "/quit"):
+                    break
+                if user_in == "/reset":
+                    agent.reset()
+                    print("[history cleared]\n")
+                    continue
+
+                reply = await agent.chat(user_in)
+                print(f"\nclaude> {reply}\n")
 
 
 if __name__ == "__main__":
