@@ -7,6 +7,7 @@ Run:
     python minimal_agent.py
 """
 
+import argparse
 import asyncio
 import json
 import subprocess
@@ -19,6 +20,7 @@ from mcp.client.stdio import stdio_client
 
 load_dotenv()
 MODEL = "claude-sonnet-4-6"
+SESSIONS_DIR = Path("sessions")
 SUMMARY_PREFIX = "[Earlier conversation summary]\n"
 
 NATIVE_TOOLS = [
@@ -81,6 +83,19 @@ def execute_native_tool(name: str, args: dict) -> str:
         except Exception as e:
             return f"ERROR writing {args['path']}: {e}"
     return f"ERROR: unknown native tool {name}"
+
+
+def _serialize_messages(messages: list) -> list:
+    """Convert SDK content blocks (pydantic) into JSON-safe dicts."""
+    out = []
+    for msg in messages:
+        content = msg["content"]
+        if isinstance(content, str):
+            out.append({"role": msg["role"], "content": content})
+            continue
+        blocks = [b.model_dump() if hasattr(b, "model_dump") else b for b in content]
+        out.append({"role": msg["role"], "content": blocks})
+    return out
 
 
 async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
@@ -304,9 +319,30 @@ class Agent:
     def reset(self):
         self.messages = []
 
+    def save(self, name: str) -> Path:
+        SESSIONS_DIR.mkdir(exist_ok=True)
+        path = SESSIONS_DIR / f"{name}.json"
+        path.write_text(
+            json.dumps(_serialize_messages(self.messages), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return path
+
+    def load(self, name: str) -> int:
+        path = SESSIONS_DIR / f"{name}.json"
+        self.messages = json.loads(path.read_text(encoding="utf-8"))
+        return len(self.messages)
+
+    @staticmethod
+    def list_sessions() -> list[str]:
+        if not SESSIONS_DIR.exists():
+            return []
+        return sorted(p.stem for p in SESSIONS_DIR.glob("*.json"))
+
 
 async def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", help="Load a saved session by name on startup")
     parser.add_argument(
         "--max-input-tokens", type=int, default=100_000,
         help="Trigger auto-trim when input tokens exceed this (default 100000)",
@@ -338,7 +374,7 @@ async def main():
 
             print(f"[init] native tools: {[t['name'] for t in NATIVE_TOOLS]}")
             print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
-            print("[hint] /tokens /compact /messages /reset /exit\n")
+            print("[hint] /save /load /list /tokens /compact /messages /reset /exit\n")
 
             agent = Agent(
                 client=Anthropic(),
@@ -348,6 +384,13 @@ async def main():
                 max_input_tokens=cli_args.max_input_tokens,
                 keep_recent_turns=cli_args.keep_recent_turns,
             )
+
+            if cli_args.resume:
+                try:
+                    n = agent.load(cli_args.resume)
+                    print(f"[resumed '{cli_args.resume}' with {n} messages]\n")
+                except FileNotFoundError:
+                    print(f"[no session '{cli_args.resume}', starting fresh]\n")
 
             while True:
                 try:
@@ -362,6 +405,29 @@ async def main():
                 if user_in == "/reset":
                     agent.reset()
                     print("[history cleared]\n")
+                    continue
+                if user_in == "/list":
+                    names = Agent.list_sessions()
+                    print(f"[sessions] {', '.join(names) if names else '(none)'}\n")
+                    continue
+                if user_in.startswith("/save"):
+                    parts = user_in.split(maxsplit=1)
+                    if len(parts) < 2:
+                        print("[usage] /save <name>\n")
+                        continue
+                    path = agent.save(parts[1])
+                    print(f"[saved {len(agent.messages)} messages to {path}]\n")
+                    continue
+                if user_in.startswith("/load"):
+                    parts = user_in.split(maxsplit=1)
+                    if len(parts) < 2:
+                        print("[usage] /load <name>\n")
+                        continue
+                    try:
+                        n = agent.load(parts[1])
+                        print(f"[loaded '{parts[1]}' with {n} messages]\n")
+                    except FileNotFoundError:
+                        print(f"[no session '{parts[1]}']\n")
                     continue
                 if user_in == "/tokens":
                     n = agent.count_tokens()
