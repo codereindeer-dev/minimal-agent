@@ -1,18 +1,22 @@
 """
-Minimal agent loop — Anthropic SDK + native tools + MCP server, multi-turn.
+Minimal agent loop — Anthropic SDK + native tools + MCP server + RAG memory.
 
 Run:
-    pip install anthropic python-dotenv mcp mcp-server-fetch
-    # put ANTHROPIC_API_KEY in .env
+    pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
+    # put ANTHROPIC_API_KEY and VOYAGE_API_KEY in .env
     python minimal_agent.py
 """
 
 import argparse
 import asyncio
 import json
+import math
 import subprocess
+import time
+import uuid
 from pathlib import Path
 
+import voyageai
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
@@ -20,7 +24,10 @@ from mcp.client.stdio import stdio_client
 
 load_dotenv()
 MODEL = "claude-sonnet-4-6"
+VOYAGE_MODEL = "voyage-3-lite"  # 512-dim, cheap, fast
 SESSIONS_DIR = Path("sessions")
+MEMORY_DIR = Path("memory")
+MEMORY_FILE = MEMORY_DIR / "store.jsonl"
 SUMMARY_PREFIX = "[Earlier conversation summary]\n"
 
 NATIVE_TOOLS = [
@@ -58,10 +65,119 @@ NATIVE_TOOLS = [
             "required": ["path", "content"],
         },
     },
+    {
+        "name": "remember",
+        "description": (
+            "Save a fact, preference, or note to long-term memory that persists across "
+            "sessions. Use this when the user shares something worth remembering — "
+            "their name, preferences, project context, decisions, etc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The information to remember"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional category tags",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "recall",
+        "description": (
+            "Search long-term memory via semantic similarity. Use this whenever the "
+            "user might be referencing something stored from a previous session, or "
+            "before answering questions about their preferences/history/context."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to search for"},
+                "top_k": {
+                    "type": "integer",
+                    "description": "How many results to return (default 3)",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
-def execute_native_tool(name: str, args: dict) -> str:
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+class MemoryStore:
+    """Append-only JSONL store of {id, text, tags, embedding, created} records.
+    Embeddings via Voyage AI; search via cosine similarity in memory."""
+
+    def __init__(self, path: Path = MEMORY_FILE, model: str = VOYAGE_MODEL):
+        self.path = path
+        self.model = model
+        self.client = voyageai.Client()  # reads VOYAGE_API_KEY from env
+        self.records: list[dict] = []
+        self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        with self.path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    self.records.append(json.loads(line))
+
+    def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
+        # input_type: "document" when storing, "query" when searching
+        result = self.client.embed(texts, model=self.model, input_type=input_type)
+        return result.embeddings
+
+    def add(self, text: str, tags: list[str] | None = None) -> str:
+        embedding = self._embed([text], "document")[0]
+        record = {
+            "id": uuid.uuid4().hex[:8],
+            "text": text,
+            "tags": tags or [],
+            "embedding": embedding,
+            "created": time.time(),
+        }
+        self.records.append(record)
+        MEMORY_DIR.mkdir(exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record["id"]
+
+    def search(self, query: str, top_k: int = 3) -> list[dict]:
+        if not self.records:
+            return []
+        q_emb = self._embed([query], "query")[0]
+        scored = [(_cosine(q_emb, r["embedding"]), r) for r in self.records]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "tags": r["tags"],
+                "score": round(s, 3),
+            }
+            for s, r in scored[:top_k]
+        ]
+
+    def all(self) -> list[dict]:
+        return [
+            {"id": r["id"], "text": r["text"], "tags": r["tags"]}
+            for r in self.records
+        ]
+
+
+def execute_native_tool(name: str, args: dict, memory: MemoryStore | None = None) -> str:
     if name == "run_shell":
         proc = subprocess.run(
             args["command"], shell=True, capture_output=True, text=True, timeout=30
@@ -82,6 +198,22 @@ def execute_native_tool(name: str, args: dict) -> str:
             return f"Wrote {len(args['content'])} chars to {args['path']}"
         except Exception as e:
             return f"ERROR writing {args['path']}: {e}"
+    if name == "remember":
+        if memory is None:
+            return "ERROR: memory store not initialized"
+        try:
+            rec_id = memory.add(args["text"], args.get("tags"))
+            return f"Remembered as id={rec_id}"
+        except Exception as e:
+            return f"ERROR remembering: {e}"
+    if name == "recall":
+        if memory is None:
+            return "ERROR: memory store not initialized"
+        try:
+            results = memory.search(args["query"], args.get("top_k", 3))
+            return json.dumps(results, ensure_ascii=False)
+        except Exception as e:
+            return f"ERROR recalling: {e}"
     return f"ERROR: unknown native tool {name}"
 
 
@@ -119,6 +251,7 @@ class Agent:
         session: ClientSession,
         tools: list,
         mcp_tool_names: set,
+        memory: MemoryStore | None = None,
         model: str = MODEL,
         max_turns: int = 10,
         max_input_tokens: int = 100_000,
@@ -128,6 +261,7 @@ class Agent:
         self.session = session
         self.tools = tools
         self.mcp_tool_names = mcp_tool_names
+        self.memory = memory
         self.model = model
         self.max_turns = max_turns
         self.max_input_tokens = max_input_tokens
@@ -270,7 +404,7 @@ class Agent:
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         if name in self.mcp_tool_names:
             return await call_mcp_tool(self.session, name, args)
-        return execute_native_tool(name, args)
+        return execute_native_tool(name, args, memory=self.memory)
 
     async def chat(self, user_message: str) -> str:
         """Send one user message, run the tool-use loop, return the final reply."""
@@ -372,15 +506,24 @@ async def main():
             mcp_tool_names = {t["name"] for t in mcp_tools}
             all_tools = NATIVE_TOOLS + mcp_tools
 
+            try:
+                memory = MemoryStore()
+                mem_status = f"{len(memory.records)} records loaded"
+            except Exception as e:
+                memory = None
+                mem_status = f"disabled ({e})"
+
             print(f"[init] native tools: {[t['name'] for t in NATIVE_TOOLS]}")
             print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
-            print("[hint] /save /load /list /tokens /compact /messages /reset /exit\n")
+            print(f"[init] memory:       {mem_status}")
+            print("[hint] /save /load /list /tokens /compact /messages /memories /reset /exit\n")
 
             agent = Agent(
                 client=Anthropic(),
                 session=session,
                 tools=all_tools,
                 mcp_tool_names=mcp_tool_names,
+                memory=memory,
                 max_input_tokens=cli_args.max_input_tokens,
                 keep_recent_turns=cli_args.keep_recent_turns,
             )
@@ -437,6 +580,19 @@ async def main():
                 if user_in == "/messages":
                     agent.dump()
                     print()
+                    continue
+                if user_in == "/memories":
+                    if agent.memory is None:
+                        print("[memory disabled]\n")
+                    else:
+                        items = agent.memory.all()
+                        if not items:
+                            print("  (empty)\n")
+                        else:
+                            for it in items:
+                                tags = f" {it['tags']}" if it["tags"] else ""
+                                print(f"  {it['id']}{tags}: {it['text']}")
+                            print()
                     continue
                 if user_in == "/compact":
                     before = agent.count_tokens()
