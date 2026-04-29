@@ -30,6 +30,26 @@ MEMORY_DIR = Path("memory")
 MEMORY_FILE = MEMORY_DIR / "store.jsonl"
 SUMMARY_PREFIX = "[Earlier conversation summary]\n"
 
+APPROVAL_MODES = ("auto", "ask", "safe")
+SAFE_SHELL_PREFIXES = (
+    "ls", "pwd", "cat", "head", "tail", "wc", "file", "which", "whereis",
+    "grep", "find", "tree", "echo",
+    "git status", "git log", "git diff", "git show", "git branch", "git remote",
+)
+SHELL_CHAIN_CHARS = ("|", ">", "<", "&", ";", "`", "$")
+
+
+def is_safe_shell(command: str) -> bool:
+    """True if `command` matches the read-only allow-list AND uses no shell
+    chaining metacharacters that could escalate to destructive ops."""
+    if any(ch in command for ch in SHELL_CHAIN_CHARS):
+        return False
+    cmd = command.strip().lower()
+    return any(
+        cmd == p or cmd.startswith(p + " ") for p in SAFE_SHELL_PREFIXES
+    )
+
+
 DEFAULT_SYSTEM = """\
 You are a coding agent running in a terminal REPL on the user's machine.
 
@@ -286,7 +306,10 @@ class Agent:
         max_input_tokens: int = 100_000,
         keep_recent_turns: int = 5,
         system: str | None = DEFAULT_SYSTEM,
+        approval_mode: str = "ask",
     ):
+        if approval_mode not in APPROVAL_MODES:
+            raise ValueError(f"approval_mode must be one of {APPROVAL_MODES}")
         self.client = client
         self.session = session
         self.tools = tools
@@ -297,6 +320,7 @@ class Agent:
         self.max_input_tokens = max_input_tokens
         self.keep_recent_turns = keep_recent_turns
         self.system = system
+        self.approval_mode = approval_mode
         self.messages: list = []
         self.last_input_tokens: int = 0  # from most recent response.usage
 
@@ -435,7 +459,32 @@ class Agent:
         ]
         return summary
 
+    async def _approve_run_shell(self, command: str) -> tuple[bool, str | None]:
+        """Decide whether to run a shell command. Returns (approved, decline_msg).
+        May mutate self.approval_mode if the user picks 'always'."""
+        if self.approval_mode == "auto":
+            return True, None
+        if self.approval_mode == "safe" and is_safe_shell(command):
+            return True, None
+        # ask mode, or safe mode falling through to manual approval
+        print(f"\n  [shell] Approve this command?")
+        print(f"    > {command}")
+        choice = (await asyncio.to_thread(
+            input, "    [y]es / [n]o / [a]lways (this session) > "
+        )).strip().lower()
+        if choice in ("y", "yes", ""):
+            return True, None
+        if choice in ("a", "always"):
+            self.approval_mode = "auto"
+            print("  [shell] mode -> auto (no further prompts this session)")
+            return True, None
+        return False, f"User declined to run: {command}. Suggest an alternative or stop."
+
     async def _dispatch_tool(self, name: str, args: dict) -> str:
+        if name == "run_shell":
+            approved, decline_msg = await self._approve_run_shell(args["command"])
+            if not approved:
+                return decline_msg or "User declined."
         if name in self.mcp_tool_names:
             return await call_mcp_tool(self.session, name, args)
         return execute_native_tool(name, args, memory=self.memory)
@@ -543,7 +592,19 @@ async def main():
         "--no-system", action="store_true",
         help="Disable the system prompt entirely (run model in raw mode)",
     )
+    parser.add_argument(
+        "--approval", choices=APPROVAL_MODES, default="ask",
+        help=("run_shell approval mode: 'auto' = no gating, "
+              "'ask' = prompt every command (default), "
+              "'safe' = auto-approve a read-only allow-list, prompt others"),
+    )
+    parser.add_argument(
+        "--yolo", action="store_true",
+        help="Shortcut for --approval auto (you accept all consequences)",
+    )
     cli_args = parser.parse_args()
+    if cli_args.yolo:
+        cli_args.approval = "auto"
 
     server_params = StdioServerParameters(
         command="python",
@@ -585,6 +646,8 @@ async def main():
             print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
             print(f"[init] memory:       {mem_status}")
             print(f"[init] system:       {sys_status}")
+            print(f"[init] approval:     {cli_args.approval}"
+                  f"{' (run_shell gated)' if cli_args.approval != 'auto' else ' (no gating)'}")
             print("[hint] /save /load /list /tokens /compact /messages /memories /system /reset /exit\n")
 
             agent = Agent(
@@ -596,6 +659,7 @@ async def main():
                 max_input_tokens=cli_args.max_input_tokens,
                 keep_recent_turns=cli_args.keep_recent_turns,
                 system=system,
+                approval_mode=cli_args.approval,
             )
 
             if cli_args.resume:
