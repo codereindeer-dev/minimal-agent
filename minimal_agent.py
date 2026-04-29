@@ -407,7 +407,8 @@ class Agent:
         return execute_native_tool(name, args, memory=self.memory)
 
     async def chat(self, user_message: str) -> str:
-        """Send one user message, run the tool-use loop, return the final reply."""
+        """Send one user message, run the tool-use loop, stream output to stdout,
+        and return the final reply text."""
         self.messages.append({"role": "user", "content": user_message})
         folded = await self._trim_to_budget()
         if folded:
@@ -415,12 +416,22 @@ class Agent:
                   f"under {self.max_input_tokens} tokens")
 
         for _ in range(self.max_turns):
-            response = self.client.messages.create(
+            print("claude> ", end="", flush=True)
+
+            text_emitted = False
+            with self.client.messages.stream(
                 model=self.model,
                 max_tokens=1024,
                 tools=self.tools,
                 messages=self.messages,
-            )
+            ) as stream:
+                for chunk in stream.text_stream:
+                    print(chunk, end="", flush=True)
+                    text_emitted = True
+                response = stream.get_final_message()
+            if text_emitted:
+                print()  # terminate the streamed line
+
             self.last_input_tokens = response.usage.input_tokens
             self.messages.append({"role": "assistant", "content": response.content})
 
@@ -436,8 +447,8 @@ class Agent:
                         source = "mcp" if block.name in self.mcp_tool_names else "native"
                         print(f"  [{source}] {block.name}({block.input})")
                         result = await self._dispatch_tool(block.name, block.input)
-                        preview = result[:200] + ("..." if len(result) > 200 else "")
-                        print(f"  [result] {preview}")
+                        preview = result[:100] + ("..." if len(result) > 100 else "")
+                        print(f"  [result] {preview} [/result] ")
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -602,8 +613,9 @@ async def main():
                     print(f"[summary] {summary[:300]}{'...' if len(summary) > 300 else ''}\n")
                     continue
 
-                reply = await agent.chat(user_in)
-                print(f"\nclaude> {reply}  [tokens: {agent.last_input_tokens}]\n")
+                print()  # blank line before assistant output
+                await agent.chat(user_in)
+                print(f"[tokens: {agent.last_input_tokens}]\n")
 
 
 if __name__ == "__main__":
