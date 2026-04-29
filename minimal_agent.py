@@ -30,6 +30,35 @@ MEMORY_DIR = Path("memory")
 MEMORY_FILE = MEMORY_DIR / "store.jsonl"
 SUMMARY_PREFIX = "[Earlier conversation summary]\n"
 
+DEFAULT_SYSTEM = """\
+You are a coding agent running in a terminal REPL on the user's machine.
+
+Memory tools:
+- `recall` searches long-term memory across sessions. Call it BEFORE
+  answering questions about the user's preferences, history, prior
+  decisions, project context, or anything they might have told you in
+  a previous session. Do not assume the current conversation contains
+  everything you know.
+- `remember` saves a single fact, preference, or decision worth keeping
+  across sessions. Call it when the user shares such information —
+  their name, preferences, project context, conclusions reached.
+
+Style:
+- Be concise. Skip preambles like "I will now..." and never restate
+  the user's question. Lead with the action or the answer.
+- Use backticks for file paths, commands, and identifiers.
+- Reply in the same language the user is using.
+
+Safety:
+- Before calling `run_shell`, say in one short sentence what the
+  command does and why. The user is reading along and may stop you.
+- Prefer read-only commands (`ls`, `cat`, `grep`, `git status`, etc.)
+  when gathering information.
+- Never run destructive commands (`rm -rf`, `git reset --hard`,
+  `git push --force`, etc.) unless the user has explicitly asked for
+  that exact operation.
+"""
+
 NATIVE_TOOLS = [
     {
         "name": "run_shell",
@@ -256,6 +285,7 @@ class Agent:
         max_turns: int = 10,
         max_input_tokens: int = 100_000,
         keep_recent_turns: int = 5,
+        system: str | None = DEFAULT_SYSTEM,
     ):
         self.client = client
         self.session = session
@@ -266,6 +296,7 @@ class Agent:
         self.max_turns = max_turns
         self.max_input_tokens = max_input_tokens
         self.keep_recent_turns = keep_recent_turns
+        self.system = system
         self.messages: list = []
         self.last_input_tokens: int = 0  # from most recent response.usage
 
@@ -300,14 +331,17 @@ class Agent:
             print(f"  index {i}: {role:<9} {desc}")
 
     def count_tokens(self) -> int:
-        """Ask the API how many input tokens our current messages+tools use."""
+        """Ask the API how many input tokens our current messages+tools+system use."""
         if not self.messages:
             return 0
-        result = self.client.messages.count_tokens(
-            model=self.model,
-            tools=self.tools,
-            messages=self.messages,
-        )
+        kwargs = {
+            "model": self.model,
+            "tools": self.tools,
+            "messages": self.messages,
+        }
+        if self.system:
+            kwargs["system"] = self.system
+        result = self.client.messages.count_tokens(**kwargs)
         return result.input_tokens
 
     def _has_summary_prefix(self) -> bool:
@@ -415,15 +449,20 @@ class Agent:
             print(f"  [trim] rolled {folded} oldest turn(s) into summary to stay "
                   f"under {self.max_input_tokens} tokens")
 
+        stream_kwargs = {
+            "model": self.model,
+            "max_tokens": 1024,
+            "tools": self.tools,
+        }
+        if self.system:
+            stream_kwargs["system"] = self.system
+
         for _ in range(self.max_turns):
             print("claude> ", end="", flush=True)
 
             text_emitted = False
             with self.client.messages.stream(
-                model=self.model,
-                max_tokens=1024,
-                tools=self.tools,
-                messages=self.messages,
+                messages=self.messages, **stream_kwargs
             ) as stream:
                 for chunk in stream.text_stream:
                     print(chunk, end="", flush=True)
@@ -496,6 +535,14 @@ async def main():
         "--keep-recent-turns", type=int, default=5,
         help="When auto-trimming, keep this many newest turns verbatim (default 5)",
     )
+    parser.add_argument(
+        "--system-file",
+        help="Path to a file whose contents replace the built-in system prompt",
+    )
+    parser.add_argument(
+        "--no-system", action="store_true",
+        help="Disable the system prompt entirely (run model in raw mode)",
+    )
     cli_args = parser.parse_args()
 
     server_params = StdioServerParameters(
@@ -524,10 +571,21 @@ async def main():
                 memory = None
                 mem_status = f"disabled ({e})"
 
+            if cli_args.no_system:
+                system = None
+                sys_status = "disabled"
+            elif cli_args.system_file:
+                system = Path(cli_args.system_file).read_text(encoding="utf-8")
+                sys_status = f"loaded from {cli_args.system_file} ({len(system)} chars)"
+            else:
+                system = DEFAULT_SYSTEM
+                sys_status = f"built-in default ({len(system)} chars)"
+
             print(f"[init] native tools: {[t['name'] for t in NATIVE_TOOLS]}")
             print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
             print(f"[init] memory:       {mem_status}")
-            print("[hint] /save /load /list /tokens /compact /messages /memories /reset /exit\n")
+            print(f"[init] system:       {sys_status}")
+            print("[hint] /save /load /list /tokens /compact /messages /memories /system /reset /exit\n")
 
             agent = Agent(
                 client=Anthropic(),
@@ -537,6 +595,7 @@ async def main():
                 memory=memory,
                 max_input_tokens=cli_args.max_input_tokens,
                 keep_recent_turns=cli_args.keep_recent_turns,
+                system=system,
             )
 
             if cli_args.resume:
@@ -591,6 +650,14 @@ async def main():
                 if user_in == "/messages":
                     agent.dump()
                     print()
+                    continue
+                if user_in == "/system":
+                    if agent.system is None:
+                        print("[no system prompt]\n")
+                    else:
+                        print(f"--- system ({len(agent.system)} chars) ---")
+                        print(agent.system.rstrip())
+                        print("--- end ---\n")
                     continue
                 if user_in == "/memories":
                     if agent.memory is None:
