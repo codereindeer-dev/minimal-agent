@@ -63,6 +63,14 @@ Memory tools:
   across sessions. Call it when the user shares such information —
   their name, preferences, project context, conclusions reached.
 
+Sub-agents:
+- For research-heavy tasks (searching across many files, multi-step
+  exploration whose intermediate results you don't need), prefer
+  `spawn_agent` over doing it yourself. The sub-agent has its own
+  context, so its grep/read noise won't bloat your history.
+- Don't spawn for simple lookups — the sub-agent has cold context and
+  takes longer to ramp up than just running one tool yourself.
+
 Style:
 - Be concise. Skip preambles like "I will now..." and never restate
   the user's question. Lead with the action or the answer.
@@ -77,6 +85,29 @@ Safety:
 - Never run destructive commands (`rm -rf`, `git reset --hard`,
   `git push --force`, etc.) unless the user has explicitly asked for
   that exact operation.
+"""
+
+MAX_DEPTH = 2  # depth 0 = top-level user agent; depth 1 = sub-agent; no further
+
+SUBAGENT_SYSTEM = """\
+You are a focused sub-agent spawned to complete one specific task.
+
+You have NO access to the parent agent's conversation history. The task
+you were given is self-contained — work from what's in front of you.
+
+Style:
+- Do the task. Don't chat. Don't ask for clarification unless truly
+  blocked.
+- When done, respond with a focused, factual answer. No preamble like
+  "Here is what I found:" — just the result.
+- Reply in the same language the task is using.
+
+Constraints:
+- You cannot spawn further sub-agents.
+- You can read long-term memory (`recall`) but not write to it
+  (`remember` is unavailable).
+- Tool gating (e.g. `run_shell` approval) inherits from the parent
+  session and still applies.
 """
 
 NATIVE_TOOLS = [
@@ -151,6 +182,41 @@ NATIVE_TOOLS = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "spawn_agent",
+        "description": (
+            "Spawn a focused sub-agent to handle one specific task. The sub-agent "
+            "has its OWN context — it CANNOT see your conversation history, so the "
+            "task description must be fully self-contained. Use this for: "
+            "(1) searching/exploring across many files without polluting your "
+            "context, (2) getting an independent second opinion, (3) multi-step "
+            "research whose intermediate steps you don't need to see. Returns the "
+            "sub-agent's final answer as a string. The sub-agent cannot itself "
+            "spawn further sub-agents and cannot write to long-term memory."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "Self-contained task description. Include any file paths, "
+                        "constraints, or context the sub-agent needs — it sees "
+                        "nothing else from this conversation."
+                    ),
+                },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional subset of tool names to expose to the sub-agent. "
+                        "Defaults to all tools except `spawn_agent` and `remember`."
+                    ),
+                },
+            },
+            "required": ["task"],
         },
     },
 ]
@@ -307,6 +373,8 @@ class Agent:
         keep_recent_turns: int = 5,
         system: str | None = DEFAULT_SYSTEM,
         approval_mode: str = "ask",
+        silent: bool = False,
+        depth: int = 0,
     ):
         if approval_mode not in APPROVAL_MODES:
             raise ValueError(f"approval_mode must be one of {APPROVAL_MODES}")
@@ -321,6 +389,8 @@ class Agent:
         self.keep_recent_turns = keep_recent_turns
         self.system = system
         self.approval_mode = approval_mode
+        self.silent = silent      # suppress streaming/tool prints (sub-agents)
+        self.depth = depth        # 0 = user-facing; >0 = spawned by another agent
         self.messages: list = []
         self.last_input_tokens: int = 0  # from most recent response.usage
 
@@ -480,7 +550,63 @@ class Agent:
             return True, None
         return False, f"User declined to run: {command}. Suggest an alternative or stop."
 
+    async def _spawn_subagent(
+        self, task: str, allowed_tools: list[str] | None = None
+    ) -> str:
+        """Spawn a depth+1 sub-agent to handle `task`. Sub-agent has its own
+        context (no parent history), inherits approval mode, cannot recurse."""
+        if self.depth + 1 >= MAX_DEPTH:
+            return (
+                f"ERROR: max sub-agent depth ({MAX_DEPTH}) reached. "
+                "Do this task yourself instead of spawning."
+            )
+        # Strip spawn_agent (no recursion) and remember (read-only memory).
+        forbidden = {"spawn_agent", "remember"}
+        child_tools = [t for t in self.tools if t["name"] not in forbidden]
+        if allowed_tools is not None:
+            allow = set(allowed_tools) - forbidden
+            child_tools = [t for t in child_tools if t["name"] in allow]
+        child_mcp_names = {
+            t["name"] for t in child_tools if t["name"] in self.mcp_tool_names
+        }
+
+        preview = task[:60] + ("..." if len(task) > 60 else "")
+        print(f"\n  [subagent] depth={self.depth + 1} spawning: {preview}")
+
+        child = Agent(
+            client=self.client,
+            session=self.session,
+            tools=child_tools,
+            mcp_tool_names=child_mcp_names,
+            memory=self.memory,  # shared store; remember tool already stripped
+            model=self.model,
+            max_turns=8,
+            max_input_tokens=self.max_input_tokens,
+            keep_recent_turns=self.keep_recent_turns,
+            system=SUBAGENT_SYSTEM,
+            approval_mode=self.approval_mode,
+            silent=True,
+            depth=self.depth + 1,
+        )
+        try:
+            answer = await child.chat(task)
+        except Exception as e:
+            print(f"  [subagent] failed: {e}")
+            return f"ERROR: sub-agent failed: {e}"
+        n_assistant_turns = sum(
+            1 for m in child.messages if m["role"] == "assistant"
+        )
+        print(
+            f"  [subagent] done "
+            f"(turns={n_assistant_turns}, last_input_tokens={child.last_input_tokens})"
+        )
+        return answer
+
     async def _dispatch_tool(self, name: str, args: dict) -> str:
+        if name == "spawn_agent":
+            return await self._spawn_subagent(
+                args["task"], args.get("allowed_tools")
+            )
         if name == "run_shell":
             approved, decline_msg = await self._approve_run_shell(args["command"])
             if not approved:
@@ -490,11 +616,11 @@ class Agent:
         return execute_native_tool(name, args, memory=self.memory)
 
     async def chat(self, user_message: str) -> str:
-        """Send one user message, run the tool-use loop, stream output to stdout,
-        and return the final reply text."""
+        """Send one user message, run the tool-use loop, stream output to stdout
+        (unless `self.silent`), and return the final reply text."""
         self.messages.append({"role": "user", "content": user_message})
         folded = await self._trim_to_budget()
-        if folded:
+        if folded and not self.silent:
             print(f"  [trim] rolled {folded} oldest turn(s) into summary to stay "
                   f"under {self.max_input_tokens} tokens")
 
@@ -507,17 +633,19 @@ class Agent:
             stream_kwargs["system"] = self.system
 
         for _ in range(self.max_turns):
-            print("claude> ", end="", flush=True)
+            if not self.silent:
+                print("claude> ", end="", flush=True)
 
             text_emitted = False
             with self.client.messages.stream(
                 messages=self.messages, **stream_kwargs
             ) as stream:
                 for chunk in stream.text_stream:
-                    print(chunk, end="", flush=True)
+                    if not self.silent:
+                        print(chunk, end="", flush=True)
                     text_emitted = True
                 response = stream.get_final_message()
-            if text_emitted:
+            if text_emitted and not self.silent:
                 print()  # terminate the streamed line
 
             self.last_input_tokens = response.usage.input_tokens
@@ -532,11 +660,13 @@ class Agent:
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
-                        source = "mcp" if block.name in self.mcp_tool_names else "native"
-                        print(f"  [{source}] {block.name}({block.input})")
+                        if not self.silent:
+                            source = "mcp" if block.name in self.mcp_tool_names else "native"
+                            print(f"  [{source} tool] {block.name}({block.input})")
                         result = await self._dispatch_tool(block.name, block.input)
-                        preview = result[:100] + ("..." if len(result) > 100 else "")
-                        print(f"  [result] {preview} [/result] ")
+                        if not self.silent:
+                            preview = result[:100] + ("..." if len(result) > 100 else "")
+                            print(f"  [tool result] {preview} [/tool result] ")
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
