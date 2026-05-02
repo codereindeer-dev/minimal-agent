@@ -110,6 +110,35 @@ Constraints:
   session and still applies.
 """
 
+# Lifecycle events fired by Agent.chat() / _dispatch_tool().
+# Callback signatures:
+#   "user_message"      (text: str)
+#   "pre_turn"          (turn_idx: int, messages: list)
+#   "post_turn"         (turn_idx: int, response, usage)
+#   "pre_tool"          (name: str, args: dict)   raise HookBlocked to veto
+#   "post_tool"         (name: str, args: dict, result: str,
+#                        error: HookBlocked | None)
+#   "assistant_message" (text: str)
+HOOK_EVENTS = (
+    "user_message",
+    "pre_turn",
+    "post_turn",
+    "pre_tool",
+    "post_tool",
+    "assistant_message",
+)
+
+
+class HookBlocked(Exception):
+    """Raised by a `pre_tool` hook to veto a tool call. The `result` string
+    is fed back to the model in place of real execution, so the model sees
+    a normal tool_result and can react (retry differently, give up, etc.)."""
+
+    def __init__(self, result: str = "blocked by hook"):
+        super().__init__(result)
+        self.result = result
+
+
 NATIVE_TOOLS = [
     {
         "name": "run_shell",
@@ -375,6 +404,7 @@ class Agent:
         approval_mode: str = "ask",
         silent: bool = False,
         depth: int = 0,
+        hooks: dict | None = None,
     ):
         if approval_mode not in APPROVAL_MODES:
             raise ValueError(f"approval_mode must be one of {APPROVAL_MODES}")
@@ -393,6 +423,42 @@ class Agent:
         self.depth = depth        # 0 = user-facing; >0 = spawned by another agent
         self.messages: list = []
         self.last_input_tokens: int = 0  # from most recent response.usage
+        # Lifecycle hooks. Sub-agents do NOT inherit by design — hooks are the
+        # parent session's observers; spawn_subagent always builds a child with
+        # `hooks=None`, so the child starts with empty lists.
+        self.hooks: dict[str, list] = {e: [] for e in HOOK_EVENTS}
+        if hooks:
+            for event, fns in hooks.items():
+                if event not in HOOK_EVENTS:
+                    raise ValueError(
+                        f"unknown hook event: {event!r}; one of {HOOK_EVENTS}"
+                    )
+                for fn in (fns if isinstance(fns, list) else [fns]):
+                    self.hooks[event].append(fn)
+
+    def on(self, event: str, fn) -> None:
+        """Register `fn` as a callback for the lifecycle event `event`.
+        See `HOOK_EVENTS` for valid event names and their callback signatures.
+        Multiple hooks per event run in registration (FIFO) order."""
+        if event not in HOOK_EVENTS:
+            raise ValueError(
+                f"unknown hook event: {event!r}; one of {HOOK_EVENTS}"
+            )
+        self.hooks[event].append(fn)
+
+    def _fire(self, event: str, *args, **kwargs) -> None:
+        """Run all hooks registered for `event` in FIFO order. Hook exceptions
+        are swallowed (and logged unless silent) so a buggy hook can't crash
+        the agent — except `HookBlocked`, which propagates so `_dispatch_tool`
+        can route it back to the model as a synthetic tool result."""
+        for fn in self.hooks.get(event, ()):
+            try:
+                fn(*args, **kwargs)
+            except HookBlocked:
+                raise
+            except Exception as e:
+                if not self.silent:
+                    print(f"  [hook error] {event}: {type(e).__name__}: {e}")
 
     @staticmethod
     def _describe_block(block) -> str:
@@ -603,22 +669,39 @@ class Agent:
         return answer
 
     async def _dispatch_tool(self, name: str, args: dict) -> str:
-        if name == "spawn_agent":
-            return await self._spawn_subagent(
-                args["task"], args.get("allowed_tools")
-            )
+        try:
+            self._fire("pre_tool", name, args)
+        except HookBlocked as e:
+            self._fire("post_tool", name, args, e.result, e)
+            return e.result
+
+        # Approval gate: run_shell needs explicit approval before dispatch;
+        # if declined, short-circuit with the decline message.
         if name == "run_shell":
             approved, decline_msg = await self._approve_run_shell(args["command"])
             if not approved:
-                return decline_msg or "User declined."
-        if name in self.mcp_tool_names:
-            return await call_mcp_tool(self.session, name, args)
-        return execute_native_tool(name, args, memory=self.memory)
+                result = decline_msg or "User declined."
+                self._fire("post_tool", name, args, result, None)
+                return result
+
+        # Dispatch (run_shell falls through here once approved).
+        if name == "spawn_agent":
+            result = await self._spawn_subagent(
+                args["task"], args.get("allowed_tools")
+            )
+        elif name in self.mcp_tool_names:
+            result = await call_mcp_tool(self.session, name, args)
+        else:
+            result = execute_native_tool(name, args, memory=self.memory)
+
+        self._fire("post_tool", name, args, result, None)
+        return result
 
     async def chat(self, user_message: str) -> str:
         """Send one user message, run the tool-use loop, stream output to stdout
         (unless `self.silent`), and return the final reply text."""
         self.messages.append({"role": "user", "content": user_message})
+        self._fire("user_message", user_message)
         folded = await self._trim_to_budget()
         if folded and not self.silent:
             print(f"  [trim] rolled {folded} oldest turn(s) into summary to stay "
@@ -632,9 +715,11 @@ class Agent:
         if self.system:
             stream_kwargs["system"] = self.system
 
-        for _ in range(self.max_turns):
+        for turn_idx in range(self.max_turns):
             if not self.silent:
                 print("claude> ", end="", flush=True)
+
+            self._fire("pre_turn", turn_idx, self.messages)
 
             text_emitted = False
             with self.client.messages.stream(
@@ -650,11 +735,14 @@ class Agent:
 
             self.last_input_tokens = response.usage.input_tokens
             self.messages.append({"role": "assistant", "content": response.content})
+            self._fire("post_turn", turn_idx, response, response.usage)
 
             if response.stop_reason == "end_turn":
-                return "".join(
+                final_text = "".join(
                     b.text for b in response.content if b.type == "text"
                 )
+                self._fire("assistant_message", final_text)
+                return final_text
 
             if response.stop_reason == "tool_use":
                 tool_results = []
@@ -666,7 +754,7 @@ class Agent:
                         result = await self._dispatch_tool(block.name, block.input)
                         if not self.silent:
                             preview = result[:100] + ("..." if len(result) > 100 else "")
-                            print(f"  [tool result] {preview} [/tool result] ")
+                            print(f"  [tool result] {preview} \n  [/tool result] ")
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -732,6 +820,10 @@ async def main():
         "--yolo", action="store_true",
         help="Shortcut for --approval auto (you accept all consequences)",
     )
+    parser.add_argument(
+        "--trace", action="store_true",
+        help="Print every lifecycle event (hooks demo / debug)",
+    )
     cli_args = parser.parse_args()
     if cli_args.yolo:
         cli_args.approval = "auto"
@@ -791,6 +883,35 @@ async def main():
                 system=system,
                 approval_mode=cli_args.approval,
             )
+
+            if cli_args.trace:
+                # Demo: log every lifecycle event to stdout. Hooks are pure
+                # observation here — they don't mutate args or block calls.
+                def on_user(text):
+                    print(f"  [hook] user_message ({len(text)} chars)", flush=True)
+                def on_pre_turn(turn_idx, messages):
+                    print(f"  [hook] pre_turn turn={turn_idx} "
+                          f"msgs={len(messages)}", flush=True)
+                def on_post_turn(turn_idx, response, usage):
+                    print(f"  [hook] post_turn turn={turn_idx} "
+                          f"in_tok={usage.input_tokens} "
+                          f"out_tok={usage.output_tokens}", flush=True)
+                def on_pre_tool(name, args):
+                    print(f"  [hook] pre_tool {name}", flush=True)
+                def on_post_tool(name, args, result, error):
+                    tag = "BLOCKED" if error else "ok"
+                    print(f"  [hook] post_tool {name} "
+                          f"({tag}, {len(result)} chars)", flush=True)
+                def on_assistant(text):
+                    print(f"  [hook] assistant_message ({len(text)} chars)",
+                          flush=True)
+                agent.on("user_message", on_user)
+                agent.on("pre_turn", on_pre_turn)
+                agent.on("post_turn", on_post_turn)
+                agent.on("pre_tool", on_pre_tool)
+                agent.on("post_tool", on_post_tool)
+                agent.on("assistant_message", on_assistant)
+                print("[init] trace:       on (lifecycle events will be logged)")
 
             if cli_args.resume:
                 try:
