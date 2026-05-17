@@ -10,13 +10,14 @@
 
 - 跑 Claude 的 tool-use loop（request → tool call → tool result → 迴圈）
 - 串流（streaming）輸出 assistant 訊息到 stdout
-- 6 個原生工具：`run_shell` / `read_file` / `write_file` / `remember` / `recall` / `spawn_agent`
+- 7 個原生工具：`run_shell` / `read_file` / `write_file` / `remember` / `recall` / `spawn_agent` / `load_skill`
 - 接 MCP server（`mcp-server-fetch`），把它的工具跟原生工具混在一起讓模型用
 - 對話持久化（JSON 序列化、跨 session 接續）
 - Context 管理：token 計算、自動 trim（rolling summary）、手動 `/compact`
 - 長期記憶：Voyage AI embedding + JSONL append-only + cosine 相似度檢索
 - 子 agent 委派：`spawn_agent` 工具、depth 限制 ≤ 2、context 隔離
 - 6 個生命週期事件給外部 hook 註冊（`user_message`、`pre/post_turn`、`pre/post_tool`、`assistant_message`）
+- Skills（`skills/<name>/SKILL.md`）：啟動時掃描，只把 name+description 注入 system prompt，模型自己決定何時 `load_skill` 載入完整指令
 
 每個 git commit 是一個明確的小步進。 Clone 後 `git checkout` 早期 commit，從最簡單的版本一路讀上來。
 
@@ -81,6 +82,7 @@ claude> 目錄裡有 5 個項目：...
 | `/tokens` | 顯示目前 input token 用量 vs 上限 |
 | `/compact` | 手動把整段歷史摘要成一條 recap |
 | `/memories` | 列出所有長期記憶內容 |
+| `/skills` | 列出 `skills/` 下所有 skill 的 name + description |
 | `/system` | 印出目前 system prompt |
 | `/reset` | 清空對話歷史 |
 | `/exit` | 離開 |
@@ -91,6 +93,7 @@ claude> 目錄裡有 5 個項目：...
 
 ```
 minimal_agent.py    # 全部邏輯，單檔 ~1000 行
+skills/             # 每個子目錄一個 skill，內含 SKILL.md（frontmatter + 指令本文）
 sessions/           # 對話存檔（已 gitignore）
 memory/store.jsonl  # 長期記憶 append-only 檔（已 gitignore）
 README.md           # 你正在讀這個
@@ -114,6 +117,7 @@ README.md           # 你正在讀這個
 | `5c37d9a` | `run_shell` 批准提示，三種模式（auto/ask/safe）|
 | `42d603a` | 子 agent 委派（`spawn_agent` 工具、深度限制）|
 | `d7d28d6` | Lifecycle hooks（`Agent.on`、`--trace` demo flag）|
+| _next_   | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 

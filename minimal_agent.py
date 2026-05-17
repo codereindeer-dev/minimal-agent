@@ -28,6 +28,7 @@ VOYAGE_MODEL = "voyage-3-lite"  # 512-dim, cheap, fast
 SESSIONS_DIR = Path("sessions")
 MEMORY_DIR = Path("memory")
 MEMORY_FILE = MEMORY_DIR / "store.jsonl"
+SKILLS_DIR = Path("skills")
 SUMMARY_PREFIX = "[Earlier conversation summary]\n"
 
 APPROVAL_MODES = ("auto", "ask", "safe")
@@ -214,6 +215,28 @@ NATIVE_TOOLS = [
         },
     },
     {
+        "name": "load_skill",
+        "description": (
+            "Load the full instructions for a named skill. Skills are pre-written "
+            "task guides (e.g. how to work with PDFs, how to write a particular "
+            "kind of code) provided by the user. The system prompt lists the "
+            "available skill names with one-line descriptions; call this tool to "
+            "fetch the actual instructions when one of those skills matches the "
+            "current task. The returned text may also list supporting files in "
+            "the skill's directory that you can read via `read_file` on demand."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name as listed in the system prompt",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "spawn_agent",
         "description": (
             "Spawn a focused sub-agent to handle one specific task. The sub-agent "
@@ -321,7 +344,102 @@ class MemoryStore:
         ]
 
 
-def execute_native_tool(name: str, args: dict, memory: MemoryStore | None = None) -> str:
+def _parse_skill_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse minimal YAML frontmatter (--- ... ---) from a SKILL.md file.
+    Supports only top-level `key: value` lines — no nesting, no lists.
+    Returns (frontmatter_dict, body_text)."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    fm_block = text[3:end].strip()
+    body = text[end + 4:].lstrip("\n")
+    fm: dict = {}
+    for line in fm_block.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        fm[k.strip()] = v.strip().strip('"').strip("'")
+    return fm, body
+
+
+class SkillsRegistry:
+    """Discovers SKILL.md files under a skills root and loads them on demand.
+
+    Each skill is a folder with SKILL.md at its root:
+        skills/
+          git-helper/
+            SKILL.md       # frontmatter: name, description + body instructions
+            scripts/...    # optional supporting files (model reads via read_file)
+
+    Only the {name, description} pairs go into the system prompt (cheap).
+    The body is loaded only when the model calls `load_skill` for that name."""
+
+    def __init__(self, root: Path = SKILLS_DIR):
+        self.root = root
+        self.skills: dict[str, dict] = {}
+        self._discover()
+
+    def _discover(self):
+        if not self.root.exists():
+            return
+        for skill_md in sorted(self.root.glob("*/SKILL.md")):
+            try:
+                text = skill_md.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            fm, body = _parse_skill_frontmatter(text)
+            name = fm.get("name") or skill_md.parent.name
+            self.skills[name] = {
+                "name": name,
+                "description": fm.get("description", ""),
+                "dir": skill_md.parent,
+                "body": body,
+            }
+
+    def list(self) -> list[dict]:
+        return [
+            {"name": s["name"], "description": s["description"]}
+            for s in self.skills.values()
+        ]
+
+    def load(self, name: str) -> str:
+        if name not in self.skills:
+            available = ", ".join(self.skills.keys()) or "(none)"
+            return f"ERROR: unknown skill '{name}'. Available: {available}"
+        s = self.skills[name]
+        # Surface supporting files so the model knows what's available without
+        # us pulling their content into context up front (progressive disclosure).
+        extras = sorted(
+            (s["dir"] / p).as_posix()
+            for p in (q.relative_to(s["dir"]) for q in s["dir"].rglob("*"))
+            if (s["dir"] / p).is_file() and p.name != "SKILL.md"
+        )
+        out = [f"# Skill: {s['name']}", "", s["body"].rstrip()]
+        if extras:
+            out += ["", "Additional files in this skill (read with `read_file` as needed):"]
+            out += [f"  - {p}" for p in extras]
+        return "\n".join(out)
+
+    def system_addendum(self) -> str:
+        """Short blurb to append to the system prompt: names + one-liners only.
+        Empty string when no skills are present, so caller can blindly concat."""
+        if not self.skills:
+            return ""
+        lines = ["", "Available skills (call `load_skill` with the name to load full instructions):"]
+        for s in self.skills.values():
+            lines.append(f"- {s['name']}: {s['description']}")
+        return "\n".join(lines)
+
+
+def execute_native_tool(
+    name: str,
+    args: dict,
+    memory: MemoryStore | None = None,
+    skills: SkillsRegistry | None = None,
+) -> str:
     if name == "run_shell":
         proc = subprocess.run(
             args["command"], shell=True, capture_output=True, text=True, timeout=30
@@ -358,6 +476,10 @@ def execute_native_tool(name: str, args: dict, memory: MemoryStore | None = None
             return json.dumps(results, ensure_ascii=False)
         except Exception as e:
             return f"ERROR recalling: {e}"
+    if name == "load_skill":
+        if skills is None:
+            return "ERROR: skills registry not initialized"
+        return skills.load(args["name"])
     return f"ERROR: unknown native tool {name}"
 
 
@@ -396,6 +518,7 @@ class Agent:
         tools: list,
         mcp_tool_names: set,
         memory: MemoryStore | None = None,
+        skills: SkillsRegistry | None = None,
         model: str = MODEL,
         max_turns: int = 10,
         max_input_tokens: int = 100_000,
@@ -413,6 +536,7 @@ class Agent:
         self.tools = tools
         self.mcp_tool_names = mcp_tool_names
         self.memory = memory
+        self.skills = skills
         self.model = model
         self.max_turns = max_turns
         self.max_input_tokens = max_input_tokens
@@ -639,17 +763,23 @@ class Agent:
         preview = task[:60] + ("..." if len(task) > 60 else "")
         print(f"\n  [subagent] depth={self.depth + 1} spawning: {preview}")
 
+        # Sub-agent gets the same skills addendum so it can `load_skill` too.
+        child_system = SUBAGENT_SYSTEM
+        if self.skills:
+            child_system += self.skills.system_addendum()
+
         child = Agent(
             client=self.client,
             session=self.session,
             tools=child_tools,
             mcp_tool_names=child_mcp_names,
             memory=self.memory,  # shared store; remember tool already stripped
+            skills=self.skills,
             model=self.model,
             max_turns=8,
             max_input_tokens=self.max_input_tokens,
             keep_recent_turns=self.keep_recent_turns,
-            system=SUBAGENT_SYSTEM,
+            system=child_system,
             approval_mode=self.approval_mode,
             silent=True,
             depth=self.depth + 1,
@@ -692,7 +822,9 @@ class Agent:
         elif name in self.mcp_tool_names:
             result = await call_mcp_tool(self.session, name, args)
         else:
-            result = execute_native_tool(name, args, memory=self.memory)
+            result = execute_native_tool(
+                name, args, memory=self.memory, skills=self.skills
+            )
 
         self._fire("post_tool", name, args, result, None)
         return result
@@ -854,6 +986,12 @@ async def main():
                 memory = None
                 mem_status = f"disabled ({e})"
 
+            skills = SkillsRegistry()
+            skill_status = (
+                f"{len(skills.skills)} loaded ({', '.join(skills.skills.keys())})"
+                if skills.skills else f"none found in {SKILLS_DIR}/"
+            )
+
             if cli_args.no_system:
                 system = None
                 sys_status = "disabled"
@@ -864,13 +1002,19 @@ async def main():
                 system = DEFAULT_SYSTEM
                 sys_status = f"built-in default ({len(system)} chars)"
 
+            # Append skill names + one-line descriptions to whatever system
+            # prompt we ended up with (default, file, or even raw if not None).
+            if system is not None and skills.skills:
+                system = system + "\n" + skills.system_addendum()
+
             print(f"[init] native tools: {[t['name'] for t in NATIVE_TOOLS]}")
             print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
             print(f"[init] memory:       {mem_status}")
+            print(f"[init] skills:       {skill_status}")
             print(f"[init] system:       {sys_status}")
             print(f"[init] approval:     {cli_args.approval}"
                   f"{' (run_shell gated)' if cli_args.approval != 'auto' else ' (no gating)'}")
-            print("[hint] /save /load /list /tokens /compact /messages /memories /system /reset /exit\n")
+            print("[hint] /save /load /list /tokens /compact /messages /memories /skills /system /reset /exit\n")
 
             agent = Agent(
                 client=Anthropic(),
@@ -878,6 +1022,7 @@ async def main():
                 tools=all_tools,
                 mcp_tool_names=mcp_tool_names,
                 memory=memory,
+                skills=skills,
                 max_input_tokens=cli_args.max_input_tokens,
                 keep_recent_turns=cli_args.keep_recent_turns,
                 system=system,
@@ -973,6 +1118,15 @@ async def main():
                         print(f"--- system ({len(agent.system)} chars) ---")
                         print(agent.system.rstrip())
                         print("--- end ---\n")
+                    continue
+                if user_in == "/skills":
+                    items = agent.skills.list() if agent.skills else []
+                    if not items:
+                        print("  (no skills)\n")
+                    else:
+                        for it in items:
+                            print(f"  {it['name']}: {it['description']}")
+                        print()
                     continue
                 if user_in == "/memories":
                     if agent.memory is None:
