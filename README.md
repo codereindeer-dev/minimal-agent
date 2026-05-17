@@ -117,7 +117,7 @@ README.md           # 你正在讀這個
 | `5c37d9a` | `run_shell` 批准提示，三種模式（auto/ask/safe）|
 | `42d603a` | 子 agent 委派（`spawn_agent` 工具、深度限制）|
 | `d7d28d6` | Lifecycle hooks（`Agent.on`、`--trace` demo flag）|
-| _next_   | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
+| `e3a9fa8` | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 
