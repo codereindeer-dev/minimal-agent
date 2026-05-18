@@ -1,25 +1,26 @@
 # minimal-agent
 
-從零手寫的 AI agent loop，單檔 ~1000 行 Python。 Anthropic Claude SDK + native tools + MCP + 長期記憶 + 子 agent + lifecycle hooks。沒有 LangChain。
+從零手寫的 AI agent loop，單檔 Python。可換 LLM provider（Anthropic / OpenAI）+ native tools + MCP + 長期記憶 + 子 agent + lifecycle hooks + skills。沒有 LangChain、LlamaIndex 之類的 framework。
 
 ---
 
 ## 它是什麼
 
-一個檔案（`minimal_agent.py`，約 1000 行）做完這些事：
+一個檔案（`minimal_agent.py`）做完這些事：
 
-- 跑 Claude 的 tool-use loop（request → tool call → tool result → 迴圈）
-- 串流（streaming）輸出 assistant 訊息到 stdout
+- 跑 LLM 的 tool-use loop（request → tool call → tool result → 迴圈）
+- LLM provider 抽象：`--provider {anthropic,openai}` 一個旗標切換，Agent 主迴圈跨家共用
+- 串流（streaming）輸出 assistant 訊息到 stdout（兩家 provider 都支援）
 - 7 個原生工具：`run_shell` / `read_file` / `write_file` / `remember` / `recall` / `spawn_agent` / `load_skill`
 - 接 MCP server（`mcp-server-fetch`），把它的工具跟原生工具混在一起讓模型用
-- 對話持久化（JSON 序列化、跨 session 接續）
+- 對話持久化（JSON 序列化、跨 session 接續，跨 provider 也能 load）
 - Context 管理：token 計算、自動 trim（rolling summary）、手動 `/compact`
 - 長期記憶：Voyage AI embedding + JSONL append-only + cosine 相似度檢索
-- 子 agent 委派：`spawn_agent` 工具、depth 限制 ≤ 2、context 隔離
+- 子 agent 委派：`spawn_agent` 工具、depth 限制 ≤ 2、context 隔離（自動繼承 provider）
 - 6 個生命週期事件給外部 hook 註冊（`user_message`、`pre/post_turn`、`pre/post_tool`、`assistant_message`）
 - Skills（`skills/<name>/SKILL.md`）：啟動時掃描，只把 name+description 注入 system prompt，模型自己決定何時 `load_skill` 載入完整指令
 
-每個 git commit 是一個明確的小步進。 Clone 後 `git checkout` 早期 commit，從最簡單的版本一路讀上來。
+每個 git commit 都是一個可獨立 checkout 閱讀的小段。Clone 後 `git checkout` 早期 commit，從最簡單的版本一路讀上來。
 
 ---
 
@@ -27,19 +28,29 @@
 
 ```bash
 pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
+# 想用 OpenAI 再裝這兩個：
+pip install openai tiktoken
 ```
 
 建立 `.env`：
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
-VOYAGE_API_KEY=...      # 只有 remember / recall 需要
+OPENAI_API_KEY=sk-...     # 只有 --provider openai 才需要
+VOYAGE_API_KEY=...        # 只有 remember / recall 需要
 ```
 
-跑：
+跑（預設 Anthropic）：
 
 ```bash
 python minimal_agent.py
+```
+
+切到 OpenAI：
+
+```bash
+python minimal_agent.py --provider openai           # 預設 gpt-5.5
+python minimal_agent.py --provider openai --model gpt-4.1   # 覆蓋 model
 ```
 
 ```
@@ -49,7 +60,7 @@ claude> 我用 ls 看看。
   [shell] Approve this command?
     > ls
     [y]es / [n]o / [a]lways (this session) > y
-  [tool result] memory  minimal_agent.py  sessions  TUTORIAL.md ...
+  [tool result] memory  minimal_agent.py  sessions  skills ...
 claude> 目錄裡有 5 個項目：...
 [tokens: 2341]
 ```
@@ -60,6 +71,8 @@ claude> 目錄裡有 5 個項目：...
 
 | 參數 | 作用 |
 |------|------|
+| `--provider {anthropic,openai}` | 選 LLM provider（預設 anthropic）|
+| `--model <name>` | 覆蓋 provider 預設 model（anthropic=`claude-sonnet-4-6`、openai=`gpt-5.5`）|
 | `--resume <name>` | 開機時載入指定的對話 session |
 | `--max-input-tokens N` | input token 超過此值就自動 trim（預設 100k）|
 | `--keep-recent-turns N` | trim 時保留最新 N 輪不壓縮（預設 5）|
@@ -92,7 +105,7 @@ claude> 目錄裡有 5 個項目：...
 ## 專案結構
 
 ```
-minimal_agent.py    # 全部邏輯，單檔 ~1000 行
+minimal_agent.py    # 全部邏輯都在這
 skills/             # 每個子目錄一個 skill，內含 SKILL.md（frontmatter + 指令本文）
 sessions/           # 對話存檔（已 gitignore）
 memory/store.jsonl  # 長期記憶 append-only 檔（已 gitignore）
@@ -118,6 +131,7 @@ README.md           # 你正在讀這個
 | `42d603a` | 子 agent 委派（`spawn_agent` 工具、深度限制）|
 | `d7d28d6` | Lifecycle hooks（`Agent.on`、`--trace` demo flag）|
 | `e3a9fa8` | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
+| `0824aa0` | LLM provider 抽象（`--provider {anthropic,openai}` + Anthropic-canonical 訊息格式 + OpenAI 走 `/v1/responses` API + reasoning model 處理）|
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 
