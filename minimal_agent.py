@@ -1,10 +1,15 @@
 """
-Minimal agent loop — Anthropic SDK + native tools + MCP server + RAG memory.
+Minimal agent loop — pluggable LLM provider (Anthropic or OpenAI) + native
+tools + MCP server + RAG memory.
 
 Run:
     pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
+    # Optional, for the OpenAI provider:
+    #   pip install openai tiktoken
     # put ANTHROPIC_API_KEY and VOYAGE_API_KEY in .env
-    python minimal_agent.py
+    # (and OPENAI_API_KEY if launching with `--provider openai`)
+    python minimal_agent.py                    # default: Anthropic
+    python minimal_agent.py --provider openai  # use OpenAI instead
 """
 
 import argparse
@@ -14,6 +19,8 @@ import math
 import subprocess
 import time
 import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 
 import voyageai
@@ -23,7 +30,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 load_dotenv()
-MODEL = "claude-sonnet-4-6"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+OPENAI_MODEL = "gpt-5.5"
+MODEL = ANTHROPIC_MODEL  # back-compat alias for callers that import MODEL
 VOYAGE_MODEL = "voyage-3-lite"  # 512-dim, cheap, fast
 SESSIONS_DIR = Path("sessions")
 MEMORY_DIR = Path("memory")
@@ -484,16 +493,11 @@ def execute_native_tool(
 
 
 def _serialize_messages(messages: list) -> list:
-    """Convert SDK content blocks (pydantic) into JSON-safe dicts."""
-    out = []
-    for msg in messages:
-        content = msg["content"]
-        if isinstance(content, str):
-            out.append({"role": msg["role"], "content": content})
-            continue
-        blocks = [b.model_dump() if hasattr(b, "model_dump") else b for b in content]
-        out.append({"role": msg["role"], "content": blocks})
-    return out
+    """Identity pass-through. Messages are stored in the canonical dict form
+    already (NormalizedResponse returns dict blocks), so save/load is JSON-safe
+    without any conversion. Kept as a seam in case a future provider returns
+    objects that need flattening."""
+    return messages
 
 
 async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
@@ -508,18 +512,487 @@ async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
     return "\n".join(parts) if parts else ""
 
 
+# ---------------------------------------------------------------------------
+# LLM provider abstraction
+#
+# The Agent only talks to its model through `LLMProvider`. Swapping Anthropic
+# for OpenAI (or anything else) is a one-line change in main(). The canonical
+# message/tool format the Agent stores internally is Anthropic-shaped — the
+# AnthropicProvider passes it through unchanged, the OpenAIProvider translates
+# on the way out (and normalizes the response on the way back in).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NormalizedUsage:
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
+class NormalizedResponse:
+    """Provider-agnostic response. `content` is a list of dict blocks:
+        {"type": "text", "text": "..."}
+        {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
+    `stop_reason` is normalized to "end_turn" or "tool_use"."""
+    content: list[dict]
+    stop_reason: str
+    usage: NormalizedUsage
+
+
+class LLMProvider(ABC):
+    """Abstract base for LLM providers."""
+
+    name: str
+    default_model: str
+
+    @abstractmethod
+    def format_tools(self, tools: list) -> list:
+        """Convert canonical (Anthropic-shaped) tool defs to provider format."""
+
+    @abstractmethod
+    def stream(self, *, messages: list, tools: list, system: str | None,
+               model: str, max_tokens: int):
+        """Return a context manager exposing `.text_stream` (iter[str]) and
+        `.get_final_message()` -> NormalizedResponse."""
+
+    @abstractmethod
+    def create(self, *, messages: list, system: str | None,
+               model: str, max_tokens: int) -> NormalizedResponse:
+        """Non-streaming completion (used for history summaries)."""
+
+    @abstractmethod
+    def count_tokens(self, *, messages: list, tools: list,
+                     system: str | None, model: str) -> int:
+        """Estimate input tokens for the current state."""
+
+
+def _anthropic_to_normalized(resp) -> NormalizedResponse:
+    content = []
+    for block in resp.content:
+        if block.type == "text":
+            content.append({"type": "text", "text": block.text})
+        elif block.type == "tool_use":
+            content.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            })
+    return NormalizedResponse(
+        content=content,
+        stop_reason=resp.stop_reason or "end_turn",
+        usage=NormalizedUsage(
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+        ),
+    )
+
+
+class _AnthropicStream:
+    """Wraps the Anthropic SDK stream so its final message is returned in
+    NormalizedResponse shape — the agent never sees SDK-specific blocks."""
+
+    def __init__(self, client: Anthropic, kwargs: dict):
+        self.client = client
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        self._cm = self.client.messages.stream(**self.kwargs)
+        self._inner = self._cm.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._cm.__exit__(exc_type, exc, tb)
+
+    @property
+    def text_stream(self):
+        return self._inner.text_stream
+
+    def get_final_message(self) -> NormalizedResponse:
+        return _anthropic_to_normalized(self._inner.get_final_message())
+
+
+class AnthropicProvider(LLMProvider):
+    name = "anthropic"
+    default_model = ANTHROPIC_MODEL
+
+    def __init__(self):
+        self.client = Anthropic()  # reads ANTHROPIC_API_KEY from env
+
+    def format_tools(self, tools):
+        return tools  # canonical format IS Anthropic's
+
+    def stream(self, *, messages, tools, system, model, max_tokens):
+        kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+        if system:
+            kwargs["system"] = system
+        return _AnthropicStream(self.client, kwargs)
+
+    def create(self, *, messages, system, model, max_tokens):
+        kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
+        if system:
+            kwargs["system"] = system
+        return _anthropic_to_normalized(self.client.messages.create(**kwargs))
+
+    def count_tokens(self, *, messages, tools, system, model):
+        if not messages:
+            return 0
+        kwargs = {"model": model, "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+        if system:
+            kwargs["system"] = system
+        return self.client.messages.count_tokens(**kwargs).input_tokens
+
+
+class _OpenAIStream:
+    """Wraps an OpenAI Responses API stream so it exposes the same
+    `text_stream` / `get_final_message()` shape used for Anthropic. The
+    Responses API emits typed SSE events (output_item.added, output_text.delta,
+    function_call_arguments.delta, completed, …); we accumulate text + tool
+    calls per output-item and emit a NormalizedResponse at the end."""
+
+    def __init__(self, client, kwargs: dict):
+        self.client = client
+        self.kwargs = kwargs
+        self._final: NormalizedResponse | None = None
+
+    def __enter__(self):
+        self._stream = self.client.responses.create(**self.kwargs)
+        self._iter = self._iter_events()
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    @property
+    def text_stream(self):
+        return self._iter
+
+    def _iter_events(self):
+        # Accumulate per output-item state, keyed by item_id, preserving
+        # encounter order so interleaved text / tool_use blocks come out
+        # in the same sequence the model emitted them.
+        items: dict[str, dict] = {}
+        order: list[str] = []
+        usage = None
+
+        def ensure_item(item_id: str, kind: str, **defaults) -> dict:
+            if item_id not in items:
+                entry = {"kind": kind, **defaults}
+                items[item_id] = entry
+                order.append(item_id)
+            return items[item_id]
+
+        for event in self._stream:
+            etype = getattr(event, "type", None)
+
+            if etype == "response.output_item.added":
+                item = getattr(event, "item", None)
+                if item is None:
+                    continue
+                item_type = getattr(item, "type", None)
+                item_id = getattr(item, "id", None)
+                if not item_id:
+                    continue
+                if item_type == "message":
+                    ensure_item(item_id, "text", parts=[])
+                elif item_type == "function_call":
+                    ensure_item(
+                        item_id, "tool_use",
+                        call_id=getattr(item, "call_id", "") or "",
+                        name=getattr(item, "name", "") or "",
+                        arguments="",
+                    )
+                # reasoning items: ignored — we don't surface chain-of-thought
+
+            elif etype == "response.output_text.delta":
+                item_id = getattr(event, "item_id", None)
+                delta = getattr(event, "delta", "") or ""
+                if item_id:
+                    entry = ensure_item(item_id, "text", parts=[])
+                    entry["parts"].append(delta)
+                if delta:
+                    yield delta
+
+            elif etype == "response.function_call_arguments.delta":
+                item_id = getattr(event, "item_id", None)
+                delta = getattr(event, "delta", "") or ""
+                if item_id:
+                    entry = ensure_item(
+                        item_id, "tool_use",
+                        call_id="", name="", arguments="",
+                    )
+                    entry["arguments"] += delta
+
+            elif etype == "response.completed":
+                resp = getattr(event, "response", None)
+                if resp is not None:
+                    usage = getattr(resp, "usage", None)
+                    # Backfill call_id / name from final output items in case
+                    # output_item.added arrived without them (defensive).
+                    for it in (getattr(resp, "output", []) or []):
+                        if getattr(it, "type", None) != "function_call":
+                            continue
+                        it_id = getattr(it, "id", None)
+                        if it_id and it_id in items:
+                            entry = items[it_id]
+                            if not entry.get("call_id"):
+                                entry["call_id"] = getattr(it, "call_id", "") or ""
+                            if not entry.get("name"):
+                                entry["name"] = getattr(it, "name", "") or ""
+
+            elif etype in ("response.failed", "error"):
+                err = getattr(event, "error", None) or event
+                raise RuntimeError(f"OpenAI Responses stream error ({etype}): {err}")
+
+        content = []
+        for item_id in order:
+            entry = items[item_id]
+            if entry["kind"] == "text":
+                text = "".join(entry.get("parts", []))
+                if text:
+                    content.append({"type": "text", "text": text})
+            else:  # tool_use
+                raw = entry.get("arguments") or ""
+                try:
+                    inp = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    inp = {}
+                content.append({
+                    "type": "tool_use",
+                    "id": entry.get("call_id") or "",
+                    "name": entry.get("name") or "",
+                    "input": inp,
+                })
+
+        has_tool = any(b["type"] == "tool_use" for b in content)
+        in_tok = getattr(usage, "input_tokens", 0) if usage else 0
+        out_tok = getattr(usage, "output_tokens", 0) if usage else 0
+        self._final = NormalizedResponse(
+            content=content,
+            stop_reason="tool_use" if has_tool else "end_turn",
+            usage=NormalizedUsage(input_tokens=in_tok, output_tokens=out_tok),
+        )
+
+    def get_final_message(self) -> NormalizedResponse:
+        if self._final is None:
+            # Drain remaining events (covers tool-only responses where the
+            # caller never iterated text_stream because nothing streamed).
+            for _ in self._iter:
+                pass
+        assert self._final is not None
+        return self._final
+
+
+def _responses_to_normalized(resp) -> NormalizedResponse:
+    """Convert a non-streaming Responses API result into our canonical shape.
+    Walk the `output` array in order so text + tool_use blocks keep the model's
+    emission sequence; ignore reasoning items (we never surface them)."""
+    content = []
+    for item in (getattr(resp, "output", []) or []):
+        item_type = getattr(item, "type", None)
+        if item_type == "message":
+            for part in (getattr(item, "content", []) or []):
+                if getattr(part, "type", None) == "output_text":
+                    content.append({
+                        "type": "text",
+                        "text": getattr(part, "text", "") or "",
+                    })
+        elif item_type == "function_call":
+            raw = getattr(item, "arguments", "") or ""
+            try:
+                inp = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                inp = {}
+            content.append({
+                "type": "tool_use",
+                "id": getattr(item, "call_id", "") or "",
+                "name": getattr(item, "name", "") or "",
+                "input": inp,
+            })
+        # reasoning items: skipped
+    has_tool = any(b["type"] == "tool_use" for b in content)
+    usage = getattr(resp, "usage", None)
+    return NormalizedResponse(
+        content=content,
+        stop_reason="tool_use" if has_tool else "end_turn",
+        usage=NormalizedUsage(
+            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+        ),
+    )
+
+
+class OpenAIProvider(LLMProvider):
+    """Talks to OpenAI via /v1/responses (NOT /v1/chat/completions).
+
+    The Responses API is OpenAI's recommended path for reasoning models +
+    tools — chat.completions rejects `tools + reasoning_effort` on gpt-5.x.
+    Responses also unifies the budget parameter (`max_output_tokens` for
+    everything) and uses a cleaner input/output item model, so we avoid the
+    legacy two-parameter, two-message-shape split entirely.
+    """
+
+    name = "openai"
+    default_model = OPENAI_MODEL
+
+    # Models that accept the `reasoning` parameter. For an interactive agent
+    # loop we keep the effort minimal — deep reasoning per turn slows the loop
+    # without obvious wins, and tool dispatch already gives the model multiple
+    # cheap turns to refine its answer.
+    _REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+    _DEFAULT_REASONING_EFFORT = "low"
+
+    def __init__(self):
+        try:
+            from openai import OpenAI
+            import tiktoken
+        except ImportError as e:
+            raise ImportError(
+                "OpenAI provider requires `pip install openai tiktoken`"
+            ) from e
+        self.client = OpenAI()  # reads OPENAI_API_KEY from env
+        self._tiktoken = tiktoken
+
+    def _is_reasoning_model(self, model: str) -> bool:
+        return any(model.startswith(p) for p in self._REASONING_PREFIXES)
+
+    def format_tools(self, tools):
+        # Responses API uses a flat tool definition — no `function` wrapper.
+        return [
+            {
+                "type": "function",
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            }
+            for t in tools
+        ]
+
+    def _to_responses_input(self, messages: list) -> list:
+        """Translate canonical (Anthropic-shaped) messages into the Responses
+        `input` array. Each Anthropic content block becomes its own item:
+          - text blocks → {"role": "assistant", "content": "..."} messages
+          - tool_use   → {"type": "function_call", "call_id", "name", "arguments"}
+          - tool_result (user-role list content) →
+              {"type": "function_call_output", "call_id", "output"}
+
+        Order within a single assistant turn is preserved by flushing pending
+        text whenever a tool_use appears, so interleaved text/tool sequences
+        replay back to the model in the same order the model produced them.
+        """
+        out = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "user" and isinstance(content, str):
+                out.append({"role": "user", "content": content})
+            elif role == "assistant":
+                text_parts: list[str] = []
+                for block in content:
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(block["text"])
+                    elif btype == "tool_use":
+                        if text_parts:
+                            out.append({
+                                "role": "assistant",
+                                "content": "".join(text_parts),
+                            })
+                            text_parts = []
+                        out.append({
+                            "type": "function_call",
+                            "call_id": block["id"],
+                            "name": block["name"],
+                            "arguments": json.dumps(block["input"]),
+                        })
+                if text_parts:
+                    out.append({
+                        "role": "assistant",
+                        "content": "".join(text_parts),
+                    })
+            elif role == "user" and isinstance(content, list):
+                # tool_result batch: each becomes its own function_call_output
+                for block in content:
+                    if block.get("type") == "tool_result":
+                        out.append({
+                            "type": "function_call_output",
+                            "call_id": block["tool_use_id"],
+                            "output": block["content"],
+                        })
+        return out
+
+    def _build_kwargs(self, messages, system, model, max_tokens) -> dict:
+        kwargs: dict = {
+            "model": model,
+            "input": self._to_responses_input(messages),
+            "max_output_tokens": max_tokens,
+            # We manage conversation state on the client side, so don't have
+            # OpenAI retain anything server-side (cheaper + no data lingering).
+            "store": False,
+        }
+        if system:
+            kwargs["instructions"] = system
+        if self._is_reasoning_model(model):
+            kwargs["reasoning"] = {"effort": self._DEFAULT_REASONING_EFFORT}
+        return kwargs
+
+    def stream(self, *, messages, tools, system, model, max_tokens):
+        kwargs = self._build_kwargs(messages, system, model, max_tokens)
+        kwargs["stream"] = True
+        if tools:
+            kwargs["tools"] = self.format_tools(tools)
+        return _OpenAIStream(self.client, kwargs)
+
+    def create(self, *, messages, system, model, max_tokens):
+        kwargs = self._build_kwargs(messages, system, model, max_tokens)
+        resp = self.client.responses.create(**kwargs)
+        return _responses_to_normalized(resp)
+
+    def count_tokens(self, *, messages, tools, system, model):
+        # No official count_tokens endpoint — approximate with tiktoken. Good
+        # enough for the auto-trim heuristic; function-tool overhead isn't
+        # exact but stays within a reasonable margin.
+        try:
+            enc = self._tiktoken.encoding_for_model(model)
+        except KeyError:
+            enc = self._tiktoken.get_encoding("cl100k_base")
+        total = 0
+        if system:
+            total += len(enc.encode(system)) + 4
+        for item in self._to_responses_input(messages):
+            it = item.get("type")
+            if it == "function_call":
+                total += len(enc.encode(item.get("name", "")))
+                total += len(enc.encode(item.get("arguments", "") or ""))
+            elif it == "function_call_output":
+                total += len(enc.encode(item.get("output", "") or ""))
+            else:
+                c = item.get("content")
+                if isinstance(c, str):
+                    total += len(enc.encode(c))
+            total += 4  # per-item overhead
+        for t in (tools or []):
+            total += len(enc.encode(json.dumps(t)))
+        return total
+
+
 class Agent:
     """Multi-turn agent. Keeps message history across chat() calls."""
 
     def __init__(
         self,
-        client: Anthropic,
+        provider: LLMProvider,
         session: ClientSession,
         tools: list,
         mcp_tool_names: set,
         memory: MemoryStore | None = None,
         skills: SkillsRegistry | None = None,
-        model: str = MODEL,
+        model: str | None = None,
         max_turns: int = 10,
         max_input_tokens: int = 100_000,
         keep_recent_turns: int = 5,
@@ -531,13 +1004,13 @@ class Agent:
     ):
         if approval_mode not in APPROVAL_MODES:
             raise ValueError(f"approval_mode must be one of {APPROVAL_MODES}")
-        self.client = client
+        self.provider = provider
         self.session = session
         self.tools = tools
         self.mcp_tool_names = mcp_tool_names
         self.memory = memory
         self.skills = skills
-        self.model = model
+        self.model = model or provider.default_model
         self.max_turns = max_turns
         self.max_input_tokens = max_input_tokens
         self.keep_recent_turns = keep_recent_turns
@@ -585,14 +1058,13 @@ class Agent:
                     print(f"  [hook error] {event}: {type(e).__name__}: {e}")
 
     @staticmethod
-    def _describe_block(block) -> str:
-        """Return a short label for one content block (SDK object or dict)."""
-        get = (lambda k: block.get(k)) if isinstance(block, dict) else (lambda k: getattr(block, k, None))
-        btype = get("type")
+    def _describe_block(block: dict) -> str:
+        """Return a short label for one content block."""
+        btype = block.get("type")
         if btype == "text":
             return "text"
         if btype == "tool_use":
-            return f"tool_use:{get('name')}"
+            return f"tool_use:{block.get('name')}"
         if btype == "tool_result":
             return "tool_result"
         return btype or "?"
@@ -615,18 +1087,16 @@ class Agent:
             print(f"  index {i}: {role:<9} {desc}")
 
     def count_tokens(self) -> int:
-        """Ask the API how many input tokens our current messages+tools+system use."""
+        """How many input tokens our current messages+tools+system use.
+        Exact for Anthropic (API endpoint); approximated via tiktoken for OpenAI."""
         if not self.messages:
             return 0
-        kwargs = {
-            "model": self.model,
-            "tools": self.tools,
-            "messages": self.messages,
-        }
-        if self.system:
-            kwargs["system"] = self.system
-        result = self.client.messages.count_tokens(**kwargs)
-        return result.input_tokens
+        return self.provider.count_tokens(
+            messages=self.messages,
+            tools=self.tools,
+            system=self.system,
+            model=self.model,
+        )
 
     def _has_summary_prefix(self) -> bool:
         """True if messages[0] is a rolled-summary placeholder."""
@@ -667,12 +1137,13 @@ class Agent:
                 "outstanding work. Plain text only, no preamble, no headings."
             )
         prompt = messages_to_summarize + [{"role": "user", "content": instruction}]
-        response = self.client.messages.create(
+        response = self.provider.create(
+            messages=prompt,
+            system=None,
             model=self.model,
             max_tokens=2048,
-            messages=prompt,
         )
-        return "".join(b.text for b in response.content if b.type == "text")
+        return "".join(b["text"] for b in response.content if b["type"] == "text")
 
     async def _trim_to_budget(self) -> int:
         """Roll oldest turns into a summary message until under the input-token
@@ -769,7 +1240,7 @@ class Agent:
             child_system += self.skills.system_addendum()
 
         child = Agent(
-            client=self.client,
+            provider=self.provider,
             session=self.session,
             tools=child_tools,
             mcp_tool_names=child_mcp_names,
@@ -839,14 +1310,6 @@ class Agent:
             print(f"  [trim] rolled {folded} oldest turn(s) into summary to stay "
                   f"under {self.max_input_tokens} tokens")
 
-        stream_kwargs = {
-            "model": self.model,
-            "max_tokens": 1024,
-            "tools": self.tools,
-        }
-        if self.system:
-            stream_kwargs["system"] = self.system
-
         for turn_idx in range(self.max_turns):
             if not self.silent:
                 print("claude> ", end="", flush=True)
@@ -854,8 +1317,12 @@ class Agent:
             self._fire("pre_turn", turn_idx, self.messages)
 
             text_emitted = False
-            with self.client.messages.stream(
-                messages=self.messages, **stream_kwargs
+            with self.provider.stream(
+                messages=self.messages,
+                tools=self.tools,
+                system=self.system,
+                model=self.model,
+                max_tokens=1024,
             ) as stream:
                 for chunk in stream.text_stream:
                     if not self.silent:
@@ -871,7 +1338,7 @@ class Agent:
 
             if response.stop_reason == "end_turn":
                 final_text = "".join(
-                    b.text for b in response.content if b.type == "text"
+                    b["text"] for b in response.content if b["type"] == "text"
                 )
                 self._fire("assistant_message", final_text)
                 return final_text
@@ -879,17 +1346,18 @@ class Agent:
             if response.stop_reason == "tool_use":
                 tool_results = []
                 for block in response.content:
-                    if block.type == "tool_use":
+                    if block["type"] == "tool_use":
+                        b_name, b_input, b_id = block["name"], block["input"], block["id"]
                         if not self.silent:
-                            source = "mcp" if block.name in self.mcp_tool_names else "native"
-                            print(f"  [{source} tool] {block.name}({block.input})")
-                        result = await self._dispatch_tool(block.name, block.input)
+                            source = "mcp" if b_name in self.mcp_tool_names else "native"
+                            print(f"  [{source} tool] {b_name}({b_input})")
+                        result = await self._dispatch_tool(b_name, b_input)
                         if not self.silent:
                             preview = result[:100] + ("..." if len(result) > 100 else "")
                             print(f"  [tool result] {preview} \n  [/tool result] ")
                         tool_results.append({
                             "type": "tool_result",
-                            "tool_use_id": block.id,
+                            "tool_use_id": b_id,
                             "content": result,
                         })
                 self.messages.append({"role": "user", "content": tool_results})
@@ -956,9 +1424,24 @@ async def main():
         "--trace", action="store_true",
         help="Print every lifecycle event (hooks demo / debug)",
     )
+    parser.add_argument(
+        "--provider", choices=("anthropic", "openai"), default="anthropic",
+        help="LLM provider to use (default: anthropic)",
+    )
+    parser.add_argument(
+        "--model",
+        help="Override the provider's default model "
+             f"(anthropic={ANTHROPIC_MODEL}, openai={OPENAI_MODEL})",
+    )
     cli_args = parser.parse_args()
     if cli_args.yolo:
         cli_args.approval = "auto"
+
+    if cli_args.provider == "openai":
+        provider: LLMProvider = OpenAIProvider()
+    else:
+        provider = AnthropicProvider()
+    model = cli_args.model or provider.default_model
 
     server_params = StdioServerParameters(
         command="python",
@@ -1007,6 +1490,7 @@ async def main():
             if system is not None and skills.skills:
                 system = system + "\n" + skills.system_addendum()
 
+            print(f"[init] provider:     {provider.name} (model={model})")
             print(f"[init] native tools: {[t['name'] for t in NATIVE_TOOLS]}")
             print(f"[init] mcp tools:    {sorted(mcp_tool_names)}")
             print(f"[init] memory:       {mem_status}")
@@ -1017,12 +1501,13 @@ async def main():
             print("[hint] /save /load /list /tokens /compact /messages /memories /skills /system /reset /exit\n")
 
             agent = Agent(
-                client=Anthropic(),
+                provider=provider,
                 session=session,
                 tools=all_tools,
                 mcp_tool_names=mcp_tool_names,
                 memory=memory,
                 skills=skills,
+                model=model,
                 max_input_tokens=cli_args.max_input_tokens,
                 keep_recent_turns=cli_args.keep_recent_turns,
                 system=system,
