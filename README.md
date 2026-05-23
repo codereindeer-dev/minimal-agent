@@ -1,6 +1,6 @@
 # minimal-agent
 
-從零手寫的 AI agent loop，單檔 Python。可換 LLM provider（Anthropic / OpenAI）+ native tools + MCP + 長期記憶 + 子 agent + lifecycle hooks + skills。沒有 LangChain、LlamaIndex 之類的 framework。
+從零手寫的 AI agent loop（核心單檔 Python）+ 一個可選的 peer-to-peer multi-agent group chat demo。可換 LLM provider（Anthropic / OpenAI）+ native tools + MCP + 長期記憶 + sub-agent 委派 + peer-to-peer group chat + lifecycle hooks + skills。沒有 LangChain、LlamaIndex、AutoGen 之類的 framework。
 
 ---
 
@@ -102,10 +102,23 @@ claude> 目錄裡有 5 個項目：...
 
 ---
 
+## Peer-to-peer multi-agent: `group_chat.py`
+
+建在 `minimal_agent.py` 之上的可選 demo，**core 一行不動**。`GroupChat` 編排 N 個 stateful Agent 輪流發言，每輪廣播 transcript 最後 N-1 條給下個 peer（round-robin 下剛好等於「我上次以來的全部」），`[DONE]` sentinel + max_rounds 兩層終止。Demo 是 planner + coder + reviewer 合作寫 + 互相 review，抓出 single agent 自己 review 看不到的 bug。
+
+```bash
+python group_chat.py "Write a Python fib(n) function plus a quick test."
+```
+
+關鍵設計：peer 跟 sub-agent 是兩種互斥的 multi-agent 模式 —— 所以 peer 的工具不能包含 `spawn_agent` 跟 `remember`，不然 model 會 spawn sub-agent 旁路掉整個 group chat。
+
+---
+
 ## 專案結構
 
 ```
-minimal_agent.py    # 全部邏輯都在這
+minimal_agent.py    # Core agent loop，全部 single-agent 邏輯都在這
+group_chat.py       # Peer-to-peer multi-agent demo（建在 minimal_agent.py 上面，core 不動）
 skills/             # 每個子目錄一個 skill，內含 SKILL.md（frontmatter + 指令本文）
 sessions/           # 對話存檔（已 gitignore）
 memory/store.jsonl  # 長期記憶 append-only 檔（已 gitignore）
@@ -132,6 +145,7 @@ README.md           # 你正在讀這個
 | `d7d28d6` | Lifecycle hooks（`Agent.on`、`--trace` demo flag）|
 | `e3a9fa8` | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
 | `0824aa0` | LLM provider 抽象（`--provider {anthropic,openai}` + Anthropic-canonical 訊息格式 + OpenAI 走 `/v1/responses` API + reasoning model 處理）|
+| `abd1732` | Peer-to-peer multi-agent demo（`group_chat.py`：planner + coder + reviewer、N-1 滑動視窗廣播、`[DONE]` sentinel 終止、移除 `spawn_agent` + `remember` 防 group chat collapse、strict PLANNER_PROMPT 防 cosplay reviewer）|
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 
