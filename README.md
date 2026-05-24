@@ -30,6 +30,8 @@
 pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
 # 想用 OpenAI 再裝這兩個：
 pip install openai tiktoken
+# 想開 Web UI 再裝這兩個：
+pip install fastapi uvicorn
 ```
 
 建立 `.env`：
@@ -114,11 +116,24 @@ python group_chat.py "Write a Python fib(n) function plus a quick test."
 
 ---
 
+## Web UI: `web/`
+
+可選的瀏覽器介面，建在 `Agent.chat()` 之上。FastAPI + 原生 HTML/JS（沒有 React、沒有 build step）。
+
+```bash
+pip install fastapi uvicorn
+uvicorn web.server:app --reload
+# 開 http://localhost:8000
+```
+
+---
+
 ## 專案結構
 
 ```
 minimal_agent.py    # Core agent loop，全部 single-agent 邏輯都在這
 group_chat.py       # Peer-to-peer multi-agent demo（建在 minimal_agent.py 上面，core 不動）
+web/                # 可選的 Web UI（FastAPI + 原生 HTML/JS）
 skills/             # 每個子目錄一個 skill，內含 SKILL.md（frontmatter + 指令本文）
 sessions/           # 對話存檔（已 gitignore）
 memory/store.jsonl  # 長期記憶 append-only 檔（已 gitignore）
@@ -146,6 +161,7 @@ README.md           # 你正在讀這個
 | `e3a9fa8` | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
 | `0824aa0` | LLM provider 抽象（`--provider {anthropic,openai}` + Anthropic-canonical 訊息格式 + OpenAI 走 `/v1/responses` API + reasoning model 處理）|
 | `abd1732` | Peer-to-peer multi-agent demo（`group_chat.py`：planner + coder + reviewer、N-1 滑動視窗廣播、`[DONE]` sentinel 終止、移除 `spawn_agent` + `remember` 防 group chat collapse、strict PLANNER_PROMPT 防 cosplay reviewer）|
+| _(web 1)_ | Web UI commit 1：FastAPI + `POST /api/chat` + 原生 HTML/JS 單頁、非串流先看到完整回覆 |
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 
