@@ -13,6 +13,11 @@ GET  /api/stream?request_id=…   -> SSE: text / tool_start / tool_end /
                                         usage / error / done
 POST /api/approve               -> resolves a pending approval Future
 
+GET  /api/state                 -> provider, model, tokens, message history
+POST /api/reset | /api/compact
+GET  /api/sessions   POST /api/sessions/{save,load}   DELETE /api/sessions/{name}
+GET  /api/memories | /api/skills
+
 Run:
     pip install fastapi uvicorn
     uvicorn web.server:app --reload
@@ -38,10 +43,29 @@ from minimal_agent import (
     DEFAULT_SYSTEM,
     MemoryStore,
     NATIVE_TOOLS,
+    SESSIONS_DIR,
     SkillsRegistry,
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _messages_for_ui(messages: list) -> list[dict]:
+    """Flatten Agent.messages into {role, text} entries for UI display.
+    Skips tool_use / tool_result blocks — the chat view is conversational
+    only; tool calls are an in-the-moment UI affordance, not history."""
+    out = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        if isinstance(content, str):
+            out.append({"role": role, "text": content})
+            continue
+        for block in content:
+            btype = block.get("type")
+            if btype == "text" and block.get("text"):
+                out.append({"role": role, "text": block["text"]})
+    return out
 
 
 class WebAgent(Agent):
@@ -266,3 +290,93 @@ async def approve(req: ApproveRequest):
     if not fut.done():
         fut.set_result(req.decision)
     return {"ok": True}
+
+
+# ─── Sidebar: sessions / memory / skills / status ────────────────────────────
+
+
+@app.get("/api/state")
+async def get_state():
+    agent: WebAgent = app.state.agent
+    return {
+        "provider": agent.provider.name,
+        "model": agent.model,
+        "tokens": await agent.count_tokens(),
+        "max_tokens": agent.max_input_tokens,
+        "messages": _messages_for_ui(agent.messages),
+        "n_messages": len(agent.messages),
+    }
+
+
+@app.post("/api/reset")
+async def reset():
+    agent: WebAgent = app.state.agent
+    async with app.state.lock:
+        agent.reset()
+    return {"ok": True}
+
+
+@app.post("/api/compact")
+async def compact():
+    agent: WebAgent = app.state.agent
+    async with app.state.lock:
+        before = await agent.count_tokens()
+        summary = await agent.compact()
+        after = await agent.count_tokens()
+    return {"before": before, "after": after, "summary": summary}
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    return {"sessions": Agent.list_sessions()}
+
+
+class SessionRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/sessions/save")
+async def save_session(req: SessionRequest):
+    agent: WebAgent = app.state.agent
+    async with app.state.lock:
+        path = agent.save(req.name)
+    return {"path": str(path), "n_messages": len(agent.messages)}
+
+
+@app.post("/api/sessions/load")
+async def load_session(req: SessionRequest):
+    agent: WebAgent = app.state.agent
+    async with app.state.lock:
+        try:
+            n = agent.load(req.name)
+        except FileNotFoundError:
+            raise HTTPException(404, f"no session '{req.name}'")
+    return {
+        "n_messages": n,
+        "messages": _messages_for_ui(agent.messages),
+    }
+
+
+@app.delete("/api/sessions/{name}")
+async def delete_session(name: str):
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        raise HTTPException(404, f"no session '{name}'")
+    path.unlink()
+    return {"ok": True}
+
+
+@app.get("/api/memories")
+async def list_memories():
+    agent: WebAgent = app.state.agent
+    if agent.memory is None:
+        return {"enabled": False, "memories": []}
+    return {"enabled": True, "memories": agent.memory.all()}
+
+
+@app.get("/api/skills")
+async def list_skills():
+    agent: WebAgent = app.state.agent
+    if agent.skills is None:
+        return {"skills": []}
+    return {"skills": agent.skills.list()}

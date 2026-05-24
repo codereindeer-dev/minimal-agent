@@ -8,20 +8,53 @@
 </head>
 <body>
   <div id="app">
-    <header>
-      <h1>minimal-agent</h1>
-      <span id="status"></span>
-    </header>
-    <main id="chat"></main>
-    <form id="input-form">
-      <textarea
-        id="input"
-        placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
-        rows="2"
-        autofocus
-      ></textarea>
-      <button type="submit">Send</button>
-    </form>
+    <aside id="sidebar">
+      <header class="sb-header">
+        <h1>minimal-agent</h1>
+        <div id="model-line"></div>
+      </header>
+
+      <section class="sb-section">
+        <div class="sb-title">Sessions</div>
+        <div class="sb-actions">
+          <input id="session-name" type="text" placeholder="name to save…" maxlength="40">
+          <button id="session-save">Save</button>
+        </div>
+        <ul id="session-list" class="sb-list"></ul>
+      </section>
+
+      <section class="sb-section">
+        <div class="sb-title">Memories <span id="mem-count" class="sb-count"></span></div>
+        <ul id="memory-list" class="sb-list"></ul>
+      </section>
+
+      <section class="sb-section">
+        <div class="sb-title">Skills <span id="skill-count" class="sb-count"></span></div>
+        <ul id="skill-list" class="sb-list"></ul>
+      </section>
+    </aside>
+
+    <div id="main">
+      <main id="chat"></main>
+
+      <div id="chat-footer">
+        <div id="token-meter" title="Input tokens used / model context window limit"></div>
+        <div class="footer-actions">
+          <button id="btn-compact" title="Roll the whole history into a single summary">Compact</button>
+          <button id="btn-reset"   title="Clear the conversation history">Reset</button>
+        </div>
+      </div>
+
+      <form id="input-form">
+        <textarea
+          id="input"
+          placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
+          rows="2"
+          autofocus
+        ></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </div>
   </div>
   <script src="/static/app.js"></script>
 </body>
