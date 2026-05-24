@@ -1,15 +1,17 @@
 """Minimal web UI for minimal-agent.
 
 FastAPI + SSE + native HTML/JS. Boots one MCP session + one shared
-Agent on startup, holds them on app.state for the lifetime of the
+WebAgent on startup, holds them on app.state for the lifetime of the
 process. Lifecycle hooks fan agent events into per-request asyncio
 queues; SSE endpoints drain those queues to the browser.
 
 Endpoints
 ---------
 POST /api/chat                  -> {"request_id"} (background agent.chat task)
-GET  /api/stream?request_id=…   -> SSE: text / assistant_done /
+GET  /api/stream?request_id=…   -> SSE: text / tool_start / tool_end /
+                                        approval_request / assistant_done /
                                         usage / error / done
+POST /api/approve               -> resolves a pending approval Future
 
 Run:
     pip install fastapi uvicorn
@@ -40,6 +42,40 @@ from minimal_agent import (
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+class WebAgent(Agent):
+    """Agent variant whose run_shell approval flows through the active
+    request's SSE queue + a Future resolved by POST /api/approve.
+
+    Falls back to the base stdin prompt if no queue is currently bound,
+    so unit-running this class outside the web server still works."""
+
+    def __init__(self, *args, pending_approvals: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_approvals = pending_approvals
+        self._current_queue: asyncio.Queue | None = None
+
+    async def _approve_run_shell(self, command: str):
+        if self.approval_mode == "auto":
+            return True, None
+        if self._current_queue is None:
+            return await super()._approve_run_shell(command)
+        approval_id = uuid.uuid4().hex
+        fut = asyncio.get_event_loop().create_future()
+        self._pending_approvals[approval_id] = fut
+        self._current_queue.put_nowait({
+            "type": "approval_request",
+            "approval_id": approval_id,
+            "command": command,
+        })
+        try:
+            decision = await fut
+        finally:
+            self._pending_approvals.pop(approval_id, None)
+        if decision == "approve":
+            return True, None
+        return False, "User declined via UI."
 
 
 @asynccontextmanager
@@ -74,7 +110,9 @@ async def lifespan(app: FastAPI):
                 system = system + "\n" + skills.system_addendum()
 
             provider = AnthropicProvider()
-            agent = Agent(
+            app.state.pending_approvals = {}
+            agent = WebAgent(
+                pending_approvals=app.state.pending_approvals,
                 provider=provider,
                 session=session,
                 tools=all_tools,
@@ -82,7 +120,7 @@ async def lifespan(app: FastAPI):
                 memory=memory,
                 skills=skills,
                 system=system,
-                approval_mode="auto",
+                approval_mode="ask",
                 silent=True,
             )
             app.state.agent = agent
@@ -107,15 +145,23 @@ class ChatRequest(BaseModel):
     message: str
 
 
+def _truncate(s: str, n: int = 400) -> str:
+    return s if len(s) <= n else s[:n] + f"\n... [{len(s) - n} more chars]"
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    agent: Agent = app.state.agent
+    agent: WebAgent = app.state.agent
     lock: asyncio.Lock = app.state.lock
     requests: dict = app.state.requests
 
     request_id = uuid.uuid4().hex
     queue: asyncio.Queue = asyncio.Queue()
     requests[request_id] = queue
+
+    # Track the most recently-fired pre_tool so post_tool can reuse the same
+    # tool_call_id. _dispatch_tool runs sequentially, no interleaving.
+    pending_tool_id: list[str] = []
 
     def on_chunk(chunk: str):
         queue.put_nowait({"type": "text", "chunk": chunk})
@@ -130,21 +176,48 @@ async def chat(req: ChatRequest):
             "output": usage.output_tokens,
         })
 
+    def on_pre_tool(name: str, args: dict):
+        tool_call_id = uuid.uuid4().hex
+        pending_tool_id.append(tool_call_id)
+        queue.put_nowait({
+            "type": "tool_start",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "args": args,
+        })
+
+    def on_post_tool(name: str, args: dict, result: str, error):
+        tool_call_id = pending_tool_id.pop() if pending_tool_id else None
+        queue.put_nowait({
+            "type": "tool_end",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "result": _truncate(result),
+            "blocked": error is not None,
+        })
+
+    hooks_registered = [
+        ("text_chunk", on_chunk),
+        ("assistant_message", on_assistant),
+        ("post_turn", on_post_turn),
+        ("pre_tool", on_pre_tool),
+        ("post_tool", on_post_tool),
+    ]
+
     async def run():
-        agent.on("text_chunk", on_chunk)
-        agent.on("assistant_message", on_assistant)
-        agent.on("post_turn", on_post_turn)
+        for ev, fn in hooks_registered:
+            agent.on(ev, fn)
         try:
             async with lock:
-                await agent.chat(req.message)
+                agent._current_queue = queue
+                try:
+                    await agent.chat(req.message)
+                finally:
+                    agent._current_queue = None
         except Exception as e:
             queue.put_nowait({"type": "error", "message": f"{type(e).__name__}: {e}"})
         finally:
-            for ev, fn in [
-                ("text_chunk", on_chunk),
-                ("assistant_message", on_assistant),
-                ("post_turn", on_post_turn),
-            ]:
+            for ev, fn in hooks_registered:
                 if fn in agent.hooks[ev]:
                     agent.hooks[ev].remove(fn)
             queue.put_nowait({"type": "done"})
@@ -175,3 +248,21 @@ async def stream(request_id: str):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class ApproveRequest(BaseModel):
+    approval_id: str
+    decision: str  # "approve" | "deny"
+
+
+@app.post("/api/approve")
+async def approve(req: ApproveRequest):
+    pending: dict = app.state.pending_approvals
+    fut = pending.get(req.approval_id)
+    if fut is None:
+        raise HTTPException(404, "unknown approval_id")
+    if req.decision not in ("approve", "deny"):
+        raise HTTPException(400, "decision must be 'approve' or 'deny'")
+    if not fut.done():
+        fut.set_result(req.decision)
+    return {"ok": True}

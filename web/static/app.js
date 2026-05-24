@@ -4,12 +4,109 @@ const inputEl = document.getElementById("input");
 const btnEl = formEl.querySelector("button");
 const statusEl = document.getElementById("status");
 
-function addBubble(role) {
+let activeAssistantBubble = null;
+const toolCards = new Map(); // tool_call_id -> { card, resultEl }
+
+function addUserBubble(text) {
   const div = document.createElement("div");
-  div.className = `bubble ${role}`;
+  div.className = "bubble user";
+  div.textContent = text;
   chatEl.appendChild(div);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollDown();
+}
+
+function ensureAssistantBubble() {
+  if (activeAssistantBubble) return activeAssistantBubble;
+  const div = document.createElement("div");
+  div.className = "bubble assistant streaming";
+  div.textContent = "";
+  chatEl.appendChild(div);
+  activeAssistantBubble = div;
   return div;
+}
+
+function finalizeAssistantBubble(finalText) {
+  if (!activeAssistantBubble) return;
+  activeAssistantBubble.classList.remove("streaming");
+  if (finalText !== undefined) activeAssistantBubble.textContent = finalText;
+  if (!activeAssistantBubble.textContent) activeAssistantBubble.remove();
+  activeAssistantBubble = null;
+}
+
+function addToolCard(toolCallId, name, args) {
+  finalizeAssistantBubble();
+  const card = document.createElement("div");
+  card.className = "tool-card";
+  card.innerHTML = `
+    <div class="tool-header">
+      <span class="tool-name">${escapeHtml(name)}</span>
+      <span class="tool-status">running…</span>
+    </div>
+    <pre class="tool-args">${escapeHtml(JSON.stringify(args, null, 2))}</pre>
+    <pre class="tool-result hidden"></pre>
+  `;
+  chatEl.appendChild(card);
+  toolCards.set(toolCallId, {
+    card,
+    statusEl: card.querySelector(".tool-status"),
+    resultEl: card.querySelector(".tool-result"),
+  });
+  scrollDown();
+}
+
+function fillToolResult(toolCallId, result, blocked) {
+  const entry = toolCards.get(toolCallId);
+  if (!entry) return;
+  entry.statusEl.textContent = blocked ? "blocked" : "done";
+  entry.statusEl.classList.add(blocked ? "blocked" : "done");
+  entry.resultEl.textContent = result;
+  entry.resultEl.classList.remove("hidden");
+  toolCards.delete(toolCallId);
+  scrollDown();
+}
+
+function addApprovalCard(approvalId, command) {
+  finalizeAssistantBubble();
+  const card = document.createElement("div");
+  card.className = "approval-card";
+  card.innerHTML = `
+    <div class="approval-header">⚠ run_shell approval required</div>
+    <pre class="approval-cmd"></pre>
+    <div class="approval-buttons">
+      <button class="approve">Approve</button>
+      <button class="deny">Deny</button>
+    </div>
+  `;
+  card.querySelector(".approval-cmd").textContent = command;
+  const approveBtn = card.querySelector(".approve");
+  const denyBtn = card.querySelector(".deny");
+  const decide = async (decision) => {
+    approveBtn.disabled = true;
+    denyBtn.disabled = true;
+    await fetch("/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approval_id: approvalId, decision }),
+    });
+    card.classList.add(decision === "approve" ? "approved" : "denied");
+    card.querySelector(".approval-header").textContent =
+      decision === "approve" ? "✓ Approved" : "✕ Denied";
+  };
+  approveBtn.addEventListener("click", () => decide("approve"));
+  denyBtn.addEventListener("click", () => decide("deny"));
+  chatEl.appendChild(card);
+  scrollDown();
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function scrollDown() {
+  chatEl.scrollTop = chatEl.scrollHeight;
 }
 
 function setStatus(text) {
@@ -17,13 +114,7 @@ function setStatus(text) {
 }
 
 async function send(text) {
-  const userBubble = addBubble("user");
-  userBubble.textContent = text;
-
-  let bubble = addBubble("assistant");
-  bubble.textContent = "";
-  bubble.classList.add("streaming");
-
+  addUserBubble(text);
   btnEl.disabled = true;
   setStatus("thinking…");
 
@@ -37,8 +128,10 @@ async function send(text) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     requestId = (await res.json()).request_id;
   } catch (e) {
-    bubble.textContent = "Error: " + e.message;
-    bubble.classList.add("error");
+    const err = document.createElement("div");
+    err.className = "bubble assistant error";
+    err.textContent = "Error: " + e.message;
+    chatEl.appendChild(err);
     btnEl.disabled = false;
     setStatus("");
     return;
@@ -47,34 +140,46 @@ async function send(text) {
   const es = new EventSource(`/api/stream?request_id=${requestId}`);
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (ev.type === "text") {
-      bubble.textContent += ev.chunk;
-      chatEl.scrollTop = chatEl.scrollHeight;
-    } else if (ev.type === "assistant_done") {
-      bubble.classList.remove("streaming");
-      // text already accumulated from chunks; assistant_done is the
-      // authoritative final string in case of any drift
-      bubble.textContent = ev.text;
-      // start a fresh bubble for the next turn (if tool calls cause another)
-      bubble = addBubble("assistant");
-      bubble.textContent = "";
-      bubble.classList.add("streaming");
-    } else if (ev.type === "usage") {
-      setStatus(`${ev.input} in / ${ev.output} out`);
-    } else if (ev.type === "error") {
-      bubble.textContent = "Error: " + ev.message;
-      bubble.classList.add("error");
-    } else if (ev.type === "done") {
-      es.close();
-      if (!bubble.textContent) bubble.remove();
-      btnEl.disabled = false;
-      inputEl.focus();
+    switch (ev.type) {
+      case "text": {
+        const b = ensureAssistantBubble();
+        b.textContent += ev.chunk;
+        scrollDown();
+        break;
+      }
+      case "assistant_done":
+        finalizeAssistantBubble(ev.text);
+        break;
+      case "tool_start":
+        addToolCard(ev.tool_call_id, ev.name, ev.args);
+        break;
+      case "tool_end":
+        fillToolResult(ev.tool_call_id, ev.result, ev.blocked);
+        break;
+      case "approval_request":
+        addApprovalCard(ev.approval_id, ev.command);
+        break;
+      case "usage":
+        setStatus(`${ev.input} in / ${ev.output} out`);
+        break;
+      case "error": {
+        const b = ensureAssistantBubble();
+        b.textContent = "Error: " + ev.message;
+        b.classList.add("error");
+        finalizeAssistantBubble();
+        break;
+      }
+      case "done":
+        finalizeAssistantBubble();
+        es.close();
+        btnEl.disabled = false;
+        inputEl.focus();
+        break;
     }
   };
   es.onerror = () => {
     es.close();
-    if (!bubble.textContent) bubble.textContent = "(stream closed)";
-    bubble.classList.add("error");
+    finalizeAssistantBubble();
     btnEl.disabled = false;
   };
 }
