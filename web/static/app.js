@@ -4,7 +4,9 @@ const formEl = document.getElementById("input-form");
 const inputEl = document.getElementById("input");
 const sendBtn = formEl.querySelector("button");
 const tokenMeterEl = document.getElementById("token-meter");
-const modelLineEl = document.getElementById("model-line");
+const providerSelectEl = document.getElementById("provider-select");
+const modelInputEl = document.getElementById("model-input");
+const providerApplyBtn = document.getElementById("provider-apply");
 const sessionListEl = document.getElementById("session-list");
 const sessionNameEl = document.getElementById("session-name");
 const sessionSaveBtn = document.getElementById("session-save");
@@ -15,10 +17,7 @@ const skillCountEl = document.getElementById("skill-count");
 const resetBtn = document.getElementById("btn-reset");
 const compactBtn = document.getElementById("btn-compact");
 
-// ─── chat state ──────────────────────────────────────────────────────────────
-let activeAssistantBubble = null;
-const toolCards = new Map();
-
+// ─── shared helpers ──────────────────────────────────────────────────────────
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -26,9 +25,13 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 
-function scrollDown() {
-  chatEl.scrollTop = chatEl.scrollHeight;
+function scrollDownEl(el) {
+  el.scrollTop = el.scrollHeight;
 }
+
+// ─── single-chat state ───────────────────────────────────────────────────────
+let activeAssistantBubble = null;
+const toolCards = new Map();
 
 function clearChat() {
   chatEl.innerHTML = "";
@@ -41,7 +44,7 @@ function addUserBubble(text) {
   div.className = "bubble user";
   div.textContent = text;
   chatEl.appendChild(div);
-  scrollDown();
+  scrollDownEl(chatEl);
 }
 
 function addAssistantBubbleFinal(text) {
@@ -49,7 +52,7 @@ function addAssistantBubbleFinal(text) {
   div.className = "bubble assistant";
   div.textContent = text;
   chatEl.appendChild(div);
-  scrollDown();
+  scrollDownEl(chatEl);
 }
 
 function ensureAssistantBubble() {
@@ -70,8 +73,7 @@ function finalizeAssistantBubble(finalText) {
   activeAssistantBubble = null;
 }
 
-function addToolCard(toolCallId, name, args) {
-  finalizeAssistantBubble();
+function addToolCard(parent, toolCallId, name, args, registry) {
   const card = document.createElement("div");
   card.className = "tool-card";
   card.innerHTML = `
@@ -82,24 +84,24 @@ function addToolCard(toolCallId, name, args) {
     <pre class="tool-args">${escapeHtml(JSON.stringify(args, null, 2))}</pre>
     <pre class="tool-result hidden"></pre>
   `;
-  chatEl.appendChild(card);
-  toolCards.set(toolCallId, {
+  parent.appendChild(card);
+  registry.set(toolCallId, {
     card,
     statusEl: card.querySelector(".tool-status"),
     resultEl: card.querySelector(".tool-result"),
   });
-  scrollDown();
+  scrollDownEl(parent);
 }
 
-function fillToolResult(toolCallId, result, blocked) {
-  const entry = toolCards.get(toolCallId);
+function fillToolResult(toolCallId, result, blocked, registry) {
+  const entry = registry.get(toolCallId);
   if (!entry) return;
   entry.statusEl.textContent = blocked ? "blocked" : "done";
   entry.statusEl.classList.add(blocked ? "blocked" : "done");
   entry.resultEl.textContent = result;
   entry.resultEl.classList.remove("hidden");
-  toolCards.delete(toolCallId);
-  scrollDown();
+  registry.delete(toolCallId);
+  scrollDownEl(entry.card.parentElement);
 }
 
 function addApprovalCard(approvalId, command) {
@@ -132,10 +134,10 @@ function addApprovalCard(approvalId, command) {
   approveBtn.addEventListener("click", () => decide("approve"));
   denyBtn.addEventListener("click", () => decide("deny"));
   chatEl.appendChild(card);
-  scrollDown();
+  scrollDownEl(chatEl);
 }
 
-// ─── send / SSE ──────────────────────────────────────────────────────────────
+// ─── send / SSE for single chat ──────────────────────────────────────────────
 async function send(text) {
   addUserBubble(text);
   sendBtn.disabled = true;
@@ -162,19 +164,19 @@ async function send(text) {
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     switch (ev.type) {
-      case "text": {
+      case "text":
         ensureAssistantBubble().textContent += ev.chunk;
-        scrollDown();
+        scrollDownEl(chatEl);
         break;
-      }
       case "assistant_done":
         finalizeAssistantBubble(ev.text);
         break;
       case "tool_start":
-        addToolCard(ev.tool_call_id, ev.name, ev.args);
+        finalizeAssistantBubble();
+        addToolCard(chatEl, ev.tool_call_id, ev.name, ev.args, toolCards);
         break;
       case "tool_end":
-        fillToolResult(ev.tool_call_id, ev.result, ev.blocked);
+        fillToolResult(ev.tool_call_id, ev.result, ev.blocked, toolCards);
         break;
       case "approval_request":
         addApprovalCard(ev.approval_id, ev.command);
@@ -220,7 +222,7 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 
-// ─── sidebar: state / sessions / memories / skills ───────────────────────────
+// ─── sidebar: state / sessions / memories / skills / provider ────────────────
 let maxTokens = 100000;
 
 function renderTokenMeter(tokens) {
@@ -245,7 +247,8 @@ async function refreshState() {
   const r = await fetch("/api/state");
   const s = await r.json();
   maxTokens = s.max_tokens;
-  modelLineEl.textContent = `${s.provider} · ${s.model}`;
+  providerSelectEl.value = s.provider;
+  modelInputEl.value = s.model;
   renderTokenMeter(s.tokens);
 }
 
@@ -347,6 +350,27 @@ async function refreshSkills() {
   }
 }
 
+async function applyProvider() {
+  const provider = providerSelectEl.value;
+  const model = modelInputEl.value.trim();
+  providerApplyBtn.disabled = true;
+  try {
+    const r = await fetch("/api/provider", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, model: model || null }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const s = await r.json();
+    modelInputEl.value = s.model;
+  } finally {
+    providerApplyBtn.disabled = false;
+  }
+}
+
+providerApplyBtn.addEventListener("click", applyProvider);
+providerSelectEl.addEventListener("change", () => { modelInputEl.value = ""; });
+
 resetBtn.addEventListener("click", async () => {
   if (!confirm("Clear the conversation history?")) return;
   await fetch("/api/reset", { method: "POST" });
@@ -364,7 +388,7 @@ compactBtn.addEventListener("click", async () => {
     note.className = "bubble assistant compact-note";
     note.textContent = `[compacted ${before} → ${after} tokens]`;
     chatEl.appendChild(note);
-    scrollDown();
+    scrollDownEl(chatEl);
     refreshState();
   } finally {
     compactBtn.disabled = false;

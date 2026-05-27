@@ -11,7 +11,14 @@
     <aside id="sidebar">
       <header class="sb-header">
         <h1>minimal-agent</h1>
-        <div id="model-line"></div>
+        <div class="sb-provider">
+          <select id="provider-select">
+            <option value="anthropic">anthropic</option>
+            <option value="openai">openai</option>
+          </select>
+          <input id="model-input" type="text" placeholder="model" maxlength="60">
+          <button id="provider-apply">↻</button>
+        </div>
       </header>
 
       <section class="sb-section">

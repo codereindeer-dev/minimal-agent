@@ -55,12 +55,40 @@ body {
   letter-spacing: 0.02em;
 }
 
-#model-line {
-  margin-top: 0.2rem;
-  font-size: 0.75rem;
-  color: var(--muted);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+.sb-provider {
+  margin-top: 0.4rem;
+  display: flex;
+  gap: 0.25rem;
+  align-items: stretch;
 }
+
+.sb-provider select,
+.sb-provider input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.35rem;
+  font-size: 0.75rem;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  min-width: 0;
+}
+
+.sb-provider select { flex: 0 0 5.5rem; }
+.sb-provider input  { flex: 1; }
+
+.sb-provider button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.sb-provider button:hover { color: var(--accent); border-color: var(--accent); }
+.sb-provider button:disabled { opacity: 0.5; cursor: wait; }
 
 .sb-section {
   padding: 0.75rem 1rem;

@@ -18,6 +18,9 @@ POST /api/reset | /api/compact
 GET  /api/sessions   POST /api/sessions/{save,load}   DELETE /api/sessions/{name}
 GET  /api/memories | /api/skills
 
+GET  /api/providers             -> list available providers
+POST /api/provider              -> hot-swap agent.provider + agent.model
+
 Run:
     pip install fastapi uvicorn
     uvicorn web.server:app --reload
@@ -39,10 +42,14 @@ from pydantic import BaseModel
 
 from minimal_agent import (
     Agent,
+    ANTHROPIC_MODEL,
     AnthropicProvider,
     DEFAULT_SYSTEM,
+    LLMProvider,
     MemoryStore,
     NATIVE_TOOLS,
+    OPENAI_MODEL,
+    OpenAIProvider,
     SESSIONS_DIR,
     SkillsRegistry,
 )
@@ -380,3 +387,40 @@ async def list_skills():
     if agent.skills is None:
         return {"skills": []}
     return {"skills": agent.skills.list()}
+
+
+# ─── Provider / model switching ──────────────────────────────────────────────
+
+
+@app.get("/api/providers")
+async def list_providers():
+    agent: WebAgent = app.state.agent
+    return {
+        "providers": [
+            {"name": "anthropic", "default_model": ANTHROPIC_MODEL},
+            {"name": "openai", "default_model": OPENAI_MODEL},
+        ],
+        "current": {"provider": agent.provider.name, "model": agent.model},
+    }
+
+
+class ProviderRequest(BaseModel):
+    provider: str
+    model: str | None = None
+
+
+@app.post("/api/provider")
+async def set_provider(req: ProviderRequest):
+    agent: WebAgent = app.state.agent
+    if req.provider == "openai":
+        new_provider: LLMProvider = OpenAIProvider()
+    elif req.provider == "anthropic":
+        new_provider = AnthropicProvider()
+    else:
+        raise HTTPException(400, f"unknown provider '{req.provider}'")
+    async with app.state.lock:
+        agent.provider = new_provider
+        agent.model = req.model or new_provider.default_model
+    return {"provider": agent.provider.name, "model": agent.model}
+
+
