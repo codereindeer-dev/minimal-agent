@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import voyageai
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -124,6 +124,7 @@ Constraints:
 # Callback signatures:
 #   "user_message"      (text: str)
 #   "pre_turn"          (turn_idx: int, messages: list)
+#   "text_chunk"        (chunk: str)        fires for each streamed text delta
 #   "post_turn"         (turn_idx: int, response, usage)
 #   "pre_tool"          (name: str, args: dict)   raise HookBlocked to veto
 #   "post_tool"         (name: str, args: dict, result: str,
@@ -132,6 +133,7 @@ Constraints:
 HOOK_EVENTS = (
     "user_message",
     "pre_turn",
+    "text_chunk",
     "post_turn",
     "pre_tool",
     "post_tool",
@@ -553,17 +555,18 @@ class LLMProvider(ABC):
     @abstractmethod
     def stream(self, *, messages: list, tools: list, system: str | None,
                model: str, max_tokens: int):
-        """Return a context manager exposing `.text_stream` (iter[str]) and
-        `.get_final_message()` -> NormalizedResponse."""
+        """Return an async context manager exposing `.text_stream`
+        (AsyncIterator[str]) and `async get_final_message()` ->
+        NormalizedResponse."""
 
     @abstractmethod
-    def create(self, *, messages: list, system: str | None,
-               model: str, max_tokens: int) -> NormalizedResponse:
+    async def create(self, *, messages: list, system: str | None,
+                     model: str, max_tokens: int) -> NormalizedResponse:
         """Non-streaming completion (used for history summaries)."""
 
     @abstractmethod
-    def count_tokens(self, *, messages: list, tools: list,
-                     system: str | None, model: str) -> int:
+    async def count_tokens(self, *, messages: list, tools: list,
+                           system: str | None, model: str) -> int:
         """Estimate input tokens for the current state."""
 
 
@@ -590,27 +593,28 @@ def _anthropic_to_normalized(resp) -> NormalizedResponse:
 
 
 class _AnthropicStream:
-    """Wraps the Anthropic SDK stream so its final message is returned in
-    NormalizedResponse shape — the agent never sees SDK-specific blocks."""
+    """Wraps the Anthropic SDK async stream so its final message is returned
+    in NormalizedResponse shape — the agent never sees SDK-specific blocks.
+    Async context manager + async iterator throughout."""
 
-    def __init__(self, client: Anthropic, kwargs: dict):
+    def __init__(self, client: AsyncAnthropic, kwargs: dict):
         self.client = client
         self.kwargs = kwargs
 
-    def __enter__(self):
+    async def __aenter__(self):
         self._cm = self.client.messages.stream(**self.kwargs)
-        self._inner = self._cm.__enter__()
+        self._inner = await self._cm.__aenter__()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
-        return self._cm.__exit__(exc_type, exc, tb)
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._cm.__aexit__(exc_type, exc, tb)
 
     @property
     def text_stream(self):
-        return self._inner.text_stream
+        return self._inner.text_stream         # AsyncIterator[str]
 
-    def get_final_message(self) -> NormalizedResponse:
-        return _anthropic_to_normalized(self._inner.get_final_message())
+    async def get_final_message(self) -> NormalizedResponse:
+        return _anthropic_to_normalized(await self._inner.get_final_message())
 
 
 class AnthropicProvider(LLMProvider):
@@ -618,7 +622,11 @@ class AnthropicProvider(LLMProvider):
     default_model = ANTHROPIC_MODEL
 
     def __init__(self):
-        self.client = Anthropic()  # reads ANTHROPIC_API_KEY from env
+        # AsyncAnthropic so stream / create / count_tokens are non-blocking
+        # — the underlying SDK call awaits the HTTP read instead of holding
+        # the event loop, which matters once multiple async tasks (e.g. a
+        # web SSE generator) share the loop with agent.chat().
+        self.client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY from env
 
     def format_tools(self, tools):
         return tools  # canonical format IS Anthropic's
@@ -631,13 +639,13 @@ class AnthropicProvider(LLMProvider):
             kwargs["system"] = system
         return _AnthropicStream(self.client, kwargs)
 
-    def create(self, *, messages, system, model, max_tokens):
+    async def create(self, *, messages, system, model, max_tokens):
         kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
         if system:
             kwargs["system"] = system
-        return _anthropic_to_normalized(self.client.messages.create(**kwargs))
+        return _anthropic_to_normalized(await self.client.messages.create(**kwargs))
 
-    def count_tokens(self, *, messages, tools, system, model):
+    async def count_tokens(self, *, messages, tools, system, model):
         if not messages:
             return 0
         kwargs = {"model": model, "messages": messages}
@@ -645,7 +653,8 @@ class AnthropicProvider(LLMProvider):
             kwargs["tools"] = tools
         if system:
             kwargs["system"] = system
-        return self.client.messages.count_tokens(**kwargs).input_tokens
+        result = await self.client.messages.count_tokens(**kwargs)
+        return result.input_tokens
 
 
 class _OpenAIStream:
@@ -660,19 +669,19 @@ class _OpenAIStream:
         self.kwargs = kwargs
         self._final: NormalizedResponse | None = None
 
-    def __enter__(self):
-        self._stream = self.client.responses.create(**self.kwargs)
+    async def __aenter__(self):
+        self._stream = await self.client.responses.create(**self.kwargs)
         self._iter = self._iter_events()
         return self
 
-    def __exit__(self, *args):
+    async def __aexit__(self, *args):
         return False
 
     @property
     def text_stream(self):
         return self._iter
 
-    def _iter_events(self):
+    async def _iter_events(self):
         # Accumulate per output-item state, keyed by item_id, preserving
         # encounter order so interleaved text / tool_use blocks come out
         # in the same sequence the model emitted them.
@@ -687,7 +696,7 @@ class _OpenAIStream:
                 order.append(item_id)
             return items[item_id]
 
-        for event in self._stream:
+        async for event in self._stream:
             etype = getattr(event, "type", None)
 
             if etype == "response.output_item.added":
@@ -778,11 +787,11 @@ class _OpenAIStream:
             usage=NormalizedUsage(input_tokens=in_tok, output_tokens=out_tok),
         )
 
-    def get_final_message(self) -> NormalizedResponse:
+    async def get_final_message(self) -> NormalizedResponse:
         if self._final is None:
             # Drain remaining events (covers tool-only responses where the
             # caller never iterated text_stream because nothing streamed).
-            for _ in self._iter:
+            async for _ in self._iter:
                 pass
         assert self._final is not None
         return self._final
@@ -849,13 +858,15 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self):
         try:
-            from openai import OpenAI
+            from openai import AsyncOpenAI
             import tiktoken
         except ImportError as e:
             raise ImportError(
                 "OpenAI provider requires `pip install openai tiktoken`"
             ) from e
-        self.client = OpenAI()  # reads OPENAI_API_KEY from env
+        # AsyncOpenAI so the Responses SSE iteration is await-friendly and
+        # plays nicely with concurrent asyncio tasks (matches AnthropicProvider).
+        self.client = AsyncOpenAI()  # reads OPENAI_API_KEY from env
         self._tiktoken = tiktoken
 
     def _is_reasoning_model(self, model: str) -> bool:
@@ -948,15 +959,17 @@ class OpenAIProvider(LLMProvider):
             kwargs["tools"] = self.format_tools(tools)
         return _OpenAIStream(self.client, kwargs)
 
-    def create(self, *, messages, system, model, max_tokens):
+    async def create(self, *, messages, system, model, max_tokens):
         kwargs = self._build_kwargs(messages, system, model, max_tokens)
-        resp = self.client.responses.create(**kwargs)
+        resp = await self.client.responses.create(**kwargs)
         return _responses_to_normalized(resp)
 
-    def count_tokens(self, *, messages, tools, system, model):
+    async def count_tokens(self, *, messages, tools, system, model):
         # No official count_tokens endpoint — approximate with tiktoken. Good
         # enough for the auto-trim heuristic; function-tool overhead isn't
         # exact but stays within a reasonable margin.
+        # tiktoken is pure CPU so this `async def` body is fully synchronous;
+        # the async signature is for interface parity with AnthropicProvider.
         try:
             enc = self._tiktoken.encoding_for_model(model)
         except KeyError:
@@ -1086,12 +1099,12 @@ class Agent:
                 desc = "[" + " + ".join(self._describe_block(b) for b in content) + "]"
             print(f"  index {i}: {role:<9} {desc}")
 
-    def count_tokens(self) -> int:
+    async def count_tokens(self) -> int:
         """How many input tokens our current messages+tools+system use.
         Exact for Anthropic (API endpoint); approximated via tiktoken for OpenAI."""
         if not self.messages:
             return 0
-        return self.provider.count_tokens(
+        return await self.provider.count_tokens(
             messages=self.messages,
             tools=self.tools,
             system=self.system,
@@ -1137,7 +1150,7 @@ class Agent:
                 "outstanding work. Plain text only, no preamble, no headings."
             )
         prompt = messages_to_summarize + [{"role": "user", "content": instruction}]
-        response = self.provider.create(
+        response = await self.provider.create(
             messages=prompt,
             system=None,
             model=self.model,
@@ -1149,14 +1162,14 @@ class Agent:
         """Roll oldest turns into a summary message until under the input-token
         budget. Keeps the last `keep_recent_turns` turns verbatim. Returns the
         number of turns folded into the summary."""
-        if not self.messages or self.count_tokens() <= self.max_input_tokens:
+        if not self.messages or await self.count_tokens() <= self.max_input_tokens:
             return 0
 
         folded_total = 0
         # One pass is normally enough: after folding, the next iteration has
         # exactly keep_recent_turns real turns and excess becomes 0. The while
         # is here for safety, not repeated folding.
-        while self.count_tokens() > self.max_input_tokens:
+        while await self.count_tokens() > self.max_input_tokens:
             starts = self._turn_starts()
             has_summary = self._has_summary_prefix()
             real_starts = starts[1:] if has_summary else starts
@@ -1317,18 +1330,19 @@ class Agent:
             self._fire("pre_turn", turn_idx, self.messages)
 
             text_emitted = False
-            with self.provider.stream(
+            async with self.provider.stream(
                 messages=self.messages,
                 tools=self.tools,
                 system=self.system,
                 model=self.model,
                 max_tokens=1024,
             ) as stream:
-                for chunk in stream.text_stream:
+                async for chunk in stream.text_stream:
                     if not self.silent:
                         print(chunk, end="", flush=True)
+                    self._fire("text_chunk", chunk)
                     text_emitted = True
-                response = stream.get_final_message()
+                response = await stream.get_final_message()
             if text_emitted and not self.silent:
                 print()  # terminate the streamed line
 
@@ -1588,7 +1602,7 @@ async def main():
                         print(f"[no session '{parts[1]}']\n")
                     continue
                 if user_in == "/tokens":
-                    n = agent.count_tokens()
+                    n = await agent.count_tokens()
                     print(f"[tokens] {n} / {agent.max_input_tokens} "
                           f"({len(agent.messages)} messages)\n")
                     continue
@@ -1627,9 +1641,9 @@ async def main():
                             print()
                     continue
                 if user_in == "/compact":
-                    before = agent.count_tokens()
+                    before = await agent.count_tokens()
                     summary = await agent.compact()
-                    after = agent.count_tokens()
+                    after = await agent.count_tokens()
                     print(f"[compacted {before} -> {after} tokens]")
                     print(f"[summary] {summary[:300]}{'...' if len(summary) > 300 else ''}\n")
                     continue

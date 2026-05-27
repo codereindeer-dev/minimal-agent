@@ -162,6 +162,7 @@ README.md           # 你正在讀這個
 | `0824aa0` | LLM provider 抽象（`--provider {anthropic,openai}` + Anthropic-canonical 訊息格式 + OpenAI 走 `/v1/responses` API + reasoning model 處理）|
 | `abd1732` | Peer-to-peer multi-agent demo（`group_chat.py`：planner + coder + reviewer、N-1 滑動視窗廣播、`[DONE]` sentinel 終止、移除 `spawn_agent` + `remember` 防 group chat collapse、strict PLANNER_PROMPT 防 cosplay reviewer）|
 | _(web 1)_ | Web UI commit 1：FastAPI + `POST /api/chat` + 原生 HTML/JS 單頁、非串流先看到完整回覆 |
+| _(web 2)_ | Web UI commit 2：SSE 串流 + async LLM SDK 升級（新增 `text_chunk` lifecycle hook、`POST /api/chat` → request_id、`GET /api/stream` → EventSource、token-by-token 顯示;`Anthropic` / `OpenAI` SDK 換成 `AsyncAnthropic` / `AsyncOpenAI` 讓串流真正非阻塞）|
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 

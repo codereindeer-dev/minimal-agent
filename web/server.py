@@ -1,12 +1,15 @@
 """Minimal web UI for minimal-agent.
 
-FastAPI + native HTML/JS. Boots one MCP session + one shared Agent on
-startup, holds them on app.state for the request handlers. Same wiring
-as minimal_agent.main() — provider, tools, memory, skills.
+FastAPI + SSE + native HTML/JS. Boots one MCP session + one shared
+Agent on startup, holds them on app.state for the lifetime of the
+process. Lifecycle hooks fan agent events into per-request asyncio
+queues; SSE endpoints drain those queues to the browser.
 
 Endpoints
 ---------
-POST /api/chat  -> {"reply", "tokens"}  (synchronous, blocks on agent.chat)
+POST /api/chat                  -> {"request_id"} (background agent.chat task)
+GET  /api/stream?request_id=…   -> SSE: text / assistant_done /
+                                        usage / error / done
 
 Run:
     pip install fastapi uvicorn
@@ -14,11 +17,14 @@ Run:
     open http://localhost:8000
 """
 
+import asyncio
+import json
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -77,8 +83,11 @@ async def lifespan(app: FastAPI):
                 skills=skills,
                 system=system,
                 approval_mode="auto",
+                silent=True,
             )
             app.state.agent = agent
+            app.state.lock = asyncio.Lock()
+            app.state.requests = {}
             print(f"[web] agent ready (provider={provider.name}, "
                   f"model={agent.model}, tools={len(all_tools)})")
             print("[web] open http://localhost:8000")
@@ -101,5 +110,68 @@ class ChatRequest(BaseModel):
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     agent: Agent = app.state.agent
-    reply = await agent.chat(req.message)
-    return {"reply": reply, "tokens": agent.last_input_tokens}
+    lock: asyncio.Lock = app.state.lock
+    requests: dict = app.state.requests
+
+    request_id = uuid.uuid4().hex
+    queue: asyncio.Queue = asyncio.Queue()
+    requests[request_id] = queue
+
+    def on_chunk(chunk: str):
+        queue.put_nowait({"type": "text", "chunk": chunk})
+
+    def on_assistant(text: str):
+        queue.put_nowait({"type": "assistant_done", "text": text})
+
+    def on_post_turn(turn_idx, response, usage):
+        queue.put_nowait({
+            "type": "usage",
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+        })
+
+    async def run():
+        agent.on("text_chunk", on_chunk)
+        agent.on("assistant_message", on_assistant)
+        agent.on("post_turn", on_post_turn)
+        try:
+            async with lock:
+                await agent.chat(req.message)
+        except Exception as e:
+            queue.put_nowait({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        finally:
+            for ev, fn in [
+                ("text_chunk", on_chunk),
+                ("assistant_message", on_assistant),
+                ("post_turn", on_post_turn),
+            ]:
+                if fn in agent.hooks[ev]:
+                    agent.hooks[ev].remove(fn)
+            queue.put_nowait({"type": "done"})
+
+    asyncio.create_task(run())
+    return {"request_id": request_id}
+
+
+@app.get("/api/stream")
+async def stream(request_id: str):
+    requests: dict = app.state.requests
+    queue = requests.get(request_id)
+    if queue is None:
+        raise HTTPException(404, "unknown request_id")
+
+    async def gen():
+        try:
+            while True:
+                ev = await queue.get()
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                if ev["type"] == "done":
+                    break
+        finally:
+            requests.pop(request_id, None)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

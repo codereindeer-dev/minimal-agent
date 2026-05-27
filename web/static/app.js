@@ -4,20 +4,30 @@ const inputEl = document.getElementById("input");
 const btnEl = formEl.querySelector("button");
 const statusEl = document.getElementById("status");
 
-function addBubble(role, text) {
+function addBubble(role) {
   const div = document.createElement("div");
   div.className = `bubble ${role}`;
-  div.textContent = text;
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
   return div;
 }
 
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
 async function send(text) {
-  addBubble("user", text);
-  const pending = addBubble("assistant", "…");
+  const userBubble = addBubble("user");
+  userBubble.textContent = text;
+
+  let bubble = addBubble("assistant");
+  bubble.textContent = "";
+  bubble.classList.add("streaming");
+
   btnEl.disabled = true;
-  statusEl.textContent = "thinking…";
+  setStatus("thinking…");
+
+  let requestId;
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -25,17 +35,48 @@ async function send(text) {
       body: JSON.stringify({ message: text }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    pending.textContent = data.reply || "(no reply)";
-    statusEl.textContent = data.tokens ? `${data.tokens} tokens` : "";
+    requestId = (await res.json()).request_id;
   } catch (e) {
-    pending.textContent = "Error: " + e.message;
-    pending.classList.add("error");
-    statusEl.textContent = "";
-  } finally {
+    bubble.textContent = "Error: " + e.message;
+    bubble.classList.add("error");
     btnEl.disabled = false;
-    inputEl.focus();
+    setStatus("");
+    return;
   }
+
+  const es = new EventSource(`/api/stream?request_id=${requestId}`);
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "text") {
+      bubble.textContent += ev.chunk;
+      chatEl.scrollTop = chatEl.scrollHeight;
+    } else if (ev.type === "assistant_done") {
+      bubble.classList.remove("streaming");
+      // text already accumulated from chunks; assistant_done is the
+      // authoritative final string in case of any drift
+      bubble.textContent = ev.text;
+      // start a fresh bubble for the next turn (if tool calls cause another)
+      bubble = addBubble("assistant");
+      bubble.textContent = "";
+      bubble.classList.add("streaming");
+    } else if (ev.type === "usage") {
+      setStatus(`${ev.input} in / ${ev.output} out`);
+    } else if (ev.type === "error") {
+      bubble.textContent = "Error: " + ev.message;
+      bubble.classList.add("error");
+    } else if (ev.type === "done") {
+      es.close();
+      if (!bubble.textContent) bubble.remove();
+      btnEl.disabled = false;
+      inputEl.focus();
+    }
+  };
+  es.onerror = () => {
+    es.close();
+    if (!bubble.textContent) bubble.textContent = "(stream closed)";
+    bubble.classList.add("error");
+    btnEl.disabled = false;
+  };
 }
 
 formEl.addEventListener("submit", (e) => {

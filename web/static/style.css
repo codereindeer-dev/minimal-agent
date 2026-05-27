@@ -83,6 +83,17 @@ header h1 {
   border: 1px solid var(--border);
 }
 
+.bubble.assistant.streaming::after {
+  content: "▍";
+  margin-left: 2px;
+  color: var(--accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to { visibility: hidden; }
+}
+
 .bubble.error {
   color: var(--error);
   border-color: var(--error);
