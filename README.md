@@ -1,6 +1,6 @@
 # minimal-agent
 
-從零手寫的 AI agent loop（核心單檔 Python）+ 一個可選的 peer-to-peer multi-agent group chat demo。可換 LLM provider（Anthropic / OpenAI）+ native tools + MCP + 長期記憶 + sub-agent 委派 + peer-to-peer group chat + lifecycle hooks + skills。沒有 LangChain、LlamaIndex、AutoGen 之類的 framework。
+從零手寫的 AI agent loop（核心單檔 Python）+ 兩個可選擴充：peer-to-peer multi-agent group chat、以及 FastAPI + SSE 瀏覽器 Web UI。可換 LLM provider（Anthropic Claude / OpenAI GPT）+ tool use / function calling + MCP + RAG 長期記憶 + sub-agent 委派 + lifecycle hooks + skills。沒有 LangChain、LlamaIndex、AutoGen 之類的 framework。
 
 ---
 
@@ -17,10 +17,8 @@
 - Context 管理：token 計算、自動 trim（rolling summary）、手動 `/compact`
 - 長期記憶：Voyage AI embedding + JSONL append-only + cosine 相似度檢索
 - 子 agent 委派：`spawn_agent` 工具、depth 限制 ≤ 2、context 隔離（自動繼承 provider）
-- 6 個生命週期事件給外部 hook 註冊（`user_message`、`pre/post_turn`、`pre/post_tool`、`assistant_message`）
+- 7 個生命週期事件給外部 hook 註冊（`user_message`、`pre/post_turn`、`text_chunk`、`pre/post_tool`、`assistant_message`）
 - Skills（`skills/<name>/SKILL.md`）：啟動時掃描，只把 name+description 注入 system prompt，模型自己決定何時 `load_skill` 載入完整指令
-
-每個 git commit 都是一個可獨立 checkout 閱讀的小段。Clone 後 `git checkout` 早期 commit，從最簡單的版本一路讀上來。
 
 ---
 
@@ -106,13 +104,11 @@ claude> 目錄裡有 5 個項目：...
 
 ## Peer-to-peer multi-agent: `group_chat.py`
 
-建在 `minimal_agent.py` 之上的可選 demo，**core 一行不動**。`GroupChat` 編排 N 個 stateful Agent 輪流發言，每輪廣播 transcript 最後 N-1 條給下個 peer（round-robin 下剛好等於「我上次以來的全部」），`[DONE]` sentinel + max_rounds 兩層終止。Demo 是 planner + coder + reviewer 合作寫 + 互相 review，抓出 single agent 自己 review 看不到的 bug。
+建在 `minimal_agent.py` 之上的可選 demo。N 個 stateful Agent 輪流發言、互相 review，`[DONE]` sentinel + max_rounds 兩層終止。Demo 跑 planner + coder + reviewer，抓出 single agent 自己 review 看不到的 bug。
 
 ```bash
 python group_chat.py "Write a Python fib(n) function plus a quick test."
 ```
-
-關鍵設計：peer 跟 sub-agent 是兩種互斥的 multi-agent 模式 —— 所以 peer 的工具不能包含 `spawn_agent` 跟 `remember`，不然 model 會 spawn sub-agent 旁路掉整個 group chat。
 
 ---
 
@@ -120,7 +116,7 @@ python group_chat.py "Write a Python fib(n) function plus a quick test."
 
 ![Web UI screenshot](docs/screenshot.png)
 
-可選的瀏覽器介面，建在 `Agent.chat()` 之上。FastAPI + 原生 HTML/JS（沒有 React、沒有 build step）。
+建在 `minimal_agent.py` 之上的可選瀏覽器介面。FastAPI + 原生 HTML/JS（沒有 React、沒有 build step）。
 
 ```bash
 pip install fastapi uvicorn
