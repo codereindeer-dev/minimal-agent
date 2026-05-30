@@ -459,7 +459,7 @@ def execute_native_tool(
             "stdout": proc.stdout,
             "stderr": proc.stderr,
             "returncode": proc.returncode,
-        })
+        }, ensure_ascii=False)
     if name == "read_file":
         try:
             return Path(args["path"]).read_text(encoding="utf-8")
