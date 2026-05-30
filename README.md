@@ -146,6 +146,8 @@ README.md           # 你正在讀這個
 
 ## Commit 演進
 
+照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
+
 | Commit | 加了什麼 |
 |--------|---------|
 | `9729fa0` | 最初版：minimal loop + mock `get_weather` 工具 |
@@ -168,8 +170,6 @@ README.md           # 你正在讀這個
 | `d7ee5e7` | Web UI commit 3：工具呼叫卡片 + `run_shell` approval flow（`pre_tool` / `post_tool` hooks → tool_start / tool_end SSE 事件；`WebAgent` 覆寫 `_approve_run_shell` → SSE + Future + `POST /api/approve` 按鈕）|
 | `8586f56` | Web UI commit 4：sidebar（sessions / memories / skills 列表）+ token meter + Reset / Compact 按鈕 + REPL 指令端點對應（`GET /api/state`、`POST /api/reset|compact`、`/api/sessions` CRUD、`GET /api/memories|skills`） |
 | `4dc6c9e` | Web UI commit 5：provider/model 熱切換下拉（`GET /api/providers`、`POST /api/provider`）；canonical message format 讓中途切換 Anthropic ↔ OpenAI 不破壞對話歷史。|
-
-照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 
 ---
 
