@@ -118,6 +118,8 @@ python group_chat.py "Write a Python fib(n) function plus a quick test."
 
 ## Web UI: `web/`
 
+![Web UI screenshot](docs/screenshot.png)
+
 可選的瀏覽器介面，建在 `Agent.chat()` 之上。FastAPI + 原生 HTML/JS（沒有 React、沒有 build step）。
 
 ```bash
@@ -161,11 +163,11 @@ README.md           # 你正在讀這個
 | `e3a9fa8` | Skills（`skills/<name>/SKILL.md` + `load_skill` 工具 + `/skills` 指令）|
 | `0824aa0` | LLM provider 抽象（`--provider {anthropic,openai}` + Anthropic-canonical 訊息格式 + OpenAI 走 `/v1/responses` API + reasoning model 處理）|
 | `abd1732` | Peer-to-peer multi-agent demo（`group_chat.py`：planner + coder + reviewer、N-1 滑動視窗廣播、`[DONE]` sentinel 終止、移除 `spawn_agent` + `remember` 防 group chat collapse、strict PLANNER_PROMPT 防 cosplay reviewer）|
-| _(web 1)_ | Web UI commit 1：FastAPI + `POST /api/chat` + 原生 HTML/JS 單頁、非串流先看到完整回覆 |
-| _(web 2)_ | Web UI commit 2：SSE 串流 + async LLM SDK 升級（新增 `text_chunk` lifecycle hook、`POST /api/chat` → request_id、`GET /api/stream` → EventSource、token-by-token 顯示;`Anthropic` / `OpenAI` SDK 換成 `AsyncAnthropic` / `AsyncOpenAI` 讓串流真正非阻塞）|
-| _(web 3)_ | Web UI commit 3：工具呼叫卡片 + `run_shell` approval flow（`pre_tool` / `post_tool` hooks → tool_start / tool_end SSE 事件；`WebAgent` 覆寫 `_approve_run_shell` → SSE + Future + `POST /api/approve` 按鈕）|
-| _(web 4)_ | Web UI commit 4：sidebar（sessions / memories / skills 列表）+ token meter + Reset / Compact 按鈕 + REPL 指令端點對應（`GET /api/state`、`POST /api/reset|compact`、`/api/sessions` CRUD、`GET /api/memories|skills`） |
-| _(web 5)_ | Web UI commit 5：provider/model 熱切換下拉（`GET /api/providers`、`POST /api/provider`）；canonical message format 讓中途切換 Anthropic ↔ OpenAI 不破壞對話歷史。|
+| `d4926f4` | Web UI commit 1：FastAPI + `POST /api/chat` + 原生 HTML/JS 單頁、非串流先看到完整回覆 |
+| `1f8b49f` | Web UI commit 2：SSE 串流 + async LLM SDK 升級（新增 `text_chunk` lifecycle hook、`POST /api/chat` → request_id、`GET /api/stream` → EventSource、token-by-token 顯示;`Anthropic` / `OpenAI` SDK 換成 `AsyncAnthropic` / `AsyncOpenAI` 讓串流真正非阻塞）|
+| `d7ee5e7` | Web UI commit 3：工具呼叫卡片 + `run_shell` approval flow（`pre_tool` / `post_tool` hooks → tool_start / tool_end SSE 事件；`WebAgent` 覆寫 `_approve_run_shell` → SSE + Future + `POST /api/approve` 按鈕）|
+| `8586f56` | Web UI commit 4：sidebar（sessions / memories / skills 列表）+ token meter + Reset / Compact 按鈕 + REPL 指令端點對應（`GET /api/state`、`POST /api/reset|compact`、`/api/sessions` CRUD、`GET /api/memories|skills`） |
+| `4dc6c9e` | Web UI commit 5：provider/model 熱切換下拉（`GET /api/providers`、`POST /api/provider`）；canonical message format 讓中途切換 Anthropic ↔ OpenAI 不破壞對話歷史。|
 
 照著讀的方式：`git checkout c1e9a04` 看最簡單的版本（~80 行），然後一路 `git log --oneline` 往新的 commit diff 過去。
 
