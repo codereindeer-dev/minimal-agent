@@ -6,16 +6,21 @@ Run:
     pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
     # Optional, for the OpenAI provider:
     #   pip install openai tiktoken
+    # Optional, for the pgvector memory backend:
+    #   pip install "psycopg[binary]"   (and a Postgres with the `vector` ext)
     # put ANTHROPIC_API_KEY and VOYAGE_API_KEY in .env
     # (and OPENAI_API_KEY if launching with `--provider openai`)
-    python minimal_agent.py                    # default: Anthropic
+    # (and DATABASE_URL if launching with `--memory pgvector`)
+    python minimal_agent.py                    # default: Anthropic + jsonl memory
     python minimal_agent.py --provider openai  # use OpenAI instead
+    python minimal_agent.py --memory pgvector  # use Postgres/pgvector memory
 """
 
 import argparse
 import asyncio
 import json
 import math
+import os
 import subprocess
 import time
 import uuid
@@ -34,6 +39,9 @@ ANTHROPIC_MODEL = "claude-sonnet-4-6"
 OPENAI_MODEL = "gpt-5.5"
 MODEL = ANTHROPIC_MODEL  # back-compat alias for callers that import MODEL
 VOYAGE_MODEL = "voyage-3-lite"  # 512-dim, cheap, fast
+VOYAGE_DIM = 512  # embedding dimensionality of VOYAGE_MODEL (must match the
+                  # pgvector column type vector(VOYAGE_DIM))
+MEMORY_BACKENDS = ("jsonl", "pgvector")
 SESSIONS_DIR = Path("sessions")
 MEMORY_DIR = Path("memory")
 MEMORY_FILE = MEMORY_DIR / "store.jsonl"
@@ -353,6 +361,126 @@ class MemoryStore:
             {"id": r["id"], "text": r["text"], "tags": r["tags"]}
             for r in self.records
         ]
+
+
+def _vec_literal(embedding: list[float]) -> str:
+    """Render an embedding as pgvector's text input format: '[1.0,2.0,...]'.
+
+    We send the vector as a text literal cast with `::vector` in SQL rather than
+    relying on the optional `pgvector` Python adapter. This keeps the dependency
+    surface to just `psycopg` + the server-side `vector` extension, and sidesteps
+    psycopg's ambiguity between a plain float list (→ float8[]) and a vector."""
+    return "[" + ",".join(repr(float(x)) for x in embedding) + "]"
+
+
+class PgVectorStore:
+    """pgvector-backed long-term memory. Drop-in for MemoryStore: exposes the
+    same add() / search() / all() interface, so the Agent and the
+    remember/recall tools can't tell which backend is underneath.
+
+    Storage + ANN search live in Postgres (one `memory` table with an HNSW
+    index on a vector(VOYAGE_DIM) column). Embeddings still come from Voyage AI;
+    similarity is the cosine-distance operator `<=>`, so ORDER BY ... LIMIT k
+    is a real indexed nearest-neighbour query instead of MemoryStore's O(n)
+    in-memory scan.
+
+    Connection string comes from the `dsn` arg or the DATABASE_URL env var, e.g.
+        postgresql://user:pass@localhost:5432/agent
+    Requires `pip install "psycopg[binary]"` and the `vector` extension
+    available on the server (CREATE EXTENSION is attempted on connect)."""
+
+    def __init__(
+        self,
+        dsn: str | None = None,
+        model: str = VOYAGE_MODEL,
+        dim: int = VOYAGE_DIM,
+        table: str = "memory",
+    ):
+        try:
+            import psycopg
+        except ImportError as e:
+            raise ImportError(
+                'pgvector backend requires `pip install "psycopg[binary]"`'
+            ) from e
+        dsn = dsn or os.environ.get("DATABASE_URL")
+        if not dsn:
+            raise ValueError(
+                "no Postgres DSN: pass dsn= or set DATABASE_URL "
+                "(e.g. postgresql://user:pass@localhost:5432/agent)"
+            )
+        self.model = model
+        self.dim = dim
+        self.table = table
+        self.client = voyageai.Client()  # reads VOYAGE_API_KEY from env
+        # autocommit so each add() persists immediately, mirroring the JSONL
+        # store's append-on-write semantics.
+        self.conn = psycopg.connect(dsn, autocommit=True)
+        self._ensure_schema()
+
+    def _ensure_schema(self):
+        try:
+            self.conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        except Exception as e:
+            raise RuntimeError(
+                "could not enable the `vector` extension (needs a superuser or "
+                "a role with CREATE privilege, or have a DBA run "
+                "`CREATE EXTENSION vector;` once): " + str(e)
+            ) from e
+        self.conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {self.table} ("
+            "  id        TEXT PRIMARY KEY,"
+            "  text      TEXT NOT NULL,"
+            "  tags      TEXT[] NOT NULL DEFAULT '{}',"
+            f"  embedding vector({self.dim}) NOT NULL,"
+            "  created   DOUBLE PRECISION NOT NULL"
+            ")"
+        )
+        # HNSW index for cosine distance. IF NOT EXISTS keeps startup idempotent.
+        self.conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {self.table}_embedding_idx "
+            f"ON {self.table} USING hnsw (embedding vector_cosine_ops)"
+        )
+
+    def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
+        result = self.client.embed(texts, model=self.model, input_type=input_type)
+        return result.embeddings
+
+    def add(self, text: str, tags: list[str] | None = None) -> str:
+        rec_id = uuid.uuid4().hex[:8]
+        embedding = self._embed([text], "document")[0]
+        self.conn.execute(
+            f"INSERT INTO {self.table} (id, text, tags, embedding, created) "
+            "VALUES (%s, %s, %s, %s::vector, %s)",
+            (rec_id, text, tags or [], _vec_literal(embedding), time.time()),
+        )
+        return rec_id
+
+    def search(self, query: str, top_k: int = 3) -> list[dict]:
+        q_emb = self._embed([query], "query")[0]
+        q_lit = _vec_literal(q_emb)
+        # `<=>` is cosine distance (0 = identical). Convert to a similarity
+        # score in [0, 1] so the shape matches MemoryStore.search().
+        cur = self.conn.execute(
+            f"SELECT id, text, tags, 1 - (embedding <=> %s::vector) AS score "
+            f"FROM {self.table} "
+            f"ORDER BY embedding <=> %s::vector "
+            "LIMIT %s",
+            (q_lit, q_lit, top_k),
+        )
+        return [
+            {"id": r[0], "text": r[1], "tags": r[2], "score": round(float(r[3]), 3)}
+            for r in cur.fetchall()
+        ]
+
+    def all(self) -> list[dict]:
+        cur = self.conn.execute(
+            f"SELECT id, text, tags FROM {self.table} ORDER BY created"
+        )
+        return [{"id": r[0], "text": r[1], "tags": r[2]} for r in cur.fetchall()]
+
+    def count(self) -> int:
+        cur = self.conn.execute(f"SELECT count(*) FROM {self.table}")
+        return cur.fetchone()[0]
 
 
 def _parse_skill_frontmatter(text: str) -> tuple[dict, str]:
@@ -1447,6 +1575,17 @@ async def main():
         help="Override the provider's default model "
              f"(anthropic={ANTHROPIC_MODEL}, openai={OPENAI_MODEL})",
     )
+    parser.add_argument(
+        "--memory", choices=MEMORY_BACKENDS, default="jsonl",
+        help=("long-term memory backend: 'jsonl' = local append-only file with "
+              "in-memory cosine search (default), 'pgvector' = Postgres + "
+              "pgvector with an HNSW index"),
+    )
+    parser.add_argument(
+        "--pg-dsn",
+        help="Postgres DSN for --memory pgvector "
+             "(default: DATABASE_URL env var)",
+    )
     cli_args = parser.parse_args()
     if cli_args.yolo:
         cli_args.approval = "auto"
@@ -1477,8 +1616,12 @@ async def main():
             all_tools = NATIVE_TOOLS + mcp_tools
 
             try:
-                memory = MemoryStore()
-                mem_status = f"{len(memory.records)} records loaded"
+                if cli_args.memory == "pgvector":
+                    memory = PgVectorStore(dsn=cli_args.pg_dsn)
+                    mem_status = f"pgvector ({memory.count()} records)"
+                else:
+                    memory = MemoryStore()
+                    mem_status = f"jsonl ({len(memory.records)} records loaded)"
             except Exception as e:
                 memory = None
                 mem_status = f"disabled ({e})"
