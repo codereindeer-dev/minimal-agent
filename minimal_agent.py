@@ -362,6 +362,23 @@ class MemoryStore:
             for r in self.records
         ]
 
+    def count(self) -> int:
+        return len(self.records)
+
+    def delete(self, rec_id: str) -> bool:
+        """Remove a record by id. JSONL is append-only, so we drop it from the
+        in-memory list and rewrite the whole file. Returns True if a record was
+        actually removed."""
+        before = len(self.records)
+        self.records = [r for r in self.records if r["id"] != rec_id]
+        if len(self.records) == before:
+            return False
+        MEMORY_DIR.mkdir(exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as f:
+            for r in self.records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        return True
+
 
 def _vec_literal(embedding: list[float]) -> str:
     """Render an embedding as pgvector's text input format: '[1.0,2.0,...]'.
@@ -411,22 +428,44 @@ class PgVectorStore:
         self.model = model
         self.dim = dim
         self.table = table
+        self.dsn = dsn
+        self._psycopg = psycopg
         self.client = voyageai.Client()  # reads VOYAGE_API_KEY from env
+        self._connect()
+        self._ensure_schema()
+
+    def _connect(self):
         # autocommit so each add() persists immediately, mirroring the JSONL
         # store's append-on-write semantics.
-        self.conn = psycopg.connect(dsn, autocommit=True)
-        self._ensure_schema()
+        self.conn = self._psycopg.connect(self.dsn, autocommit=True)
+
+    def _execute(self, sql: str, params=None):
+        """Run a statement, transparently reconnecting once if the connection
+        went stale. Long-running web servers keep this store alive for hours;
+        serverless Postgres (e.g. Neon) drops idle connections, so the first
+        query after a lull would otherwise fail with an OperationalError."""
+        try:
+            return self.conn.execute(sql, params)
+        except self._psycopg.OperationalError:
+            # Connection died (idle timeout, server suspend, SSL drop). Rebuild
+            # it and retry once; a second failure is a real error, so let it raise.
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self._connect()
+            return self.conn.execute(sql, params)
 
     def _ensure_schema(self):
         try:
-            self.conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            self._execute("CREATE EXTENSION IF NOT EXISTS vector")
         except Exception as e:
             raise RuntimeError(
                 "could not enable the `vector` extension (needs a superuser or "
                 "a role with CREATE privilege, or have a DBA run "
                 "`CREATE EXTENSION vector;` once): " + str(e)
             ) from e
-        self.conn.execute(
+        self._execute(
             f"CREATE TABLE IF NOT EXISTS {self.table} ("
             "  id        TEXT PRIMARY KEY,"
             "  text      TEXT NOT NULL,"
@@ -436,7 +475,7 @@ class PgVectorStore:
             ")"
         )
         # HNSW index for cosine distance. IF NOT EXISTS keeps startup idempotent.
-        self.conn.execute(
+        self._execute(
             f"CREATE INDEX IF NOT EXISTS {self.table}_embedding_idx "
             f"ON {self.table} USING hnsw (embedding vector_cosine_ops)"
         )
@@ -448,7 +487,7 @@ class PgVectorStore:
     def add(self, text: str, tags: list[str] | None = None) -> str:
         rec_id = uuid.uuid4().hex[:8]
         embedding = self._embed([text], "document")[0]
-        self.conn.execute(
+        self._execute(
             f"INSERT INTO {self.table} (id, text, tags, embedding, created) "
             "VALUES (%s, %s, %s, %s::vector, %s)",
             (rec_id, text, tags or [], _vec_literal(embedding), time.time()),
@@ -460,7 +499,7 @@ class PgVectorStore:
         q_lit = _vec_literal(q_emb)
         # `<=>` is cosine distance (0 = identical). Convert to a similarity
         # score in [0, 1] so the shape matches MemoryStore.search().
-        cur = self.conn.execute(
+        cur = self._execute(
             f"SELECT id, text, tags, 1 - (embedding <=> %s::vector) AS score "
             f"FROM {self.table} "
             f"ORDER BY embedding <=> %s::vector "
@@ -473,14 +512,20 @@ class PgVectorStore:
         ]
 
     def all(self) -> list[dict]:
-        cur = self.conn.execute(
+        cur = self._execute(
             f"SELECT id, text, tags FROM {self.table} ORDER BY created"
         )
         return [{"id": r[0], "text": r[1], "tags": r[2]} for r in cur.fetchall()]
 
     def count(self) -> int:
-        cur = self.conn.execute(f"SELECT count(*) FROM {self.table}")
+        cur = self._execute(f"SELECT count(*) FROM {self.table}")
         return cur.fetchone()[0]
+
+    def delete(self, rec_id: str) -> bool:
+        cur = self._execute(
+            f"DELETE FROM {self.table} WHERE id = %s", (rec_id,)
+        )
+        return cur.rowcount > 0
 
 
 def _parse_skill_frontmatter(text: str) -> tuple[dict, str]:

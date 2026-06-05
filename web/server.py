@@ -29,6 +29,7 @@ Run:
 
 import asyncio
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -50,6 +51,7 @@ from minimal_agent import (
     NATIVE_TOOLS,
     OPENAI_MODEL,
     OpenAIProvider,
+    PgVectorStore,
     SESSIONS_DIR,
     SkillsRegistry,
 )
@@ -130,10 +132,22 @@ async def lifespan(app: FastAPI):
             mcp_tool_names = {t["name"] for t in mcp_tools}
             all_tools = NATIVE_TOOLS + mcp_tools
 
+            # Memory backend is chosen at boot via the AGENT_MEMORY env var
+            # ("jsonl" default, or "pgvector"). pgvector also needs DATABASE_URL.
+            # There's no UI toggle on purpose: the two stores hold different
+            # data, so swapping at runtime would silently change what the agent
+            # can recall.
+            backend = os.environ.get("AGENT_MEMORY", "jsonl").lower()
             try:
-                memory = MemoryStore()
-            except Exception:
+                if backend == "pgvector":
+                    memory = PgVectorStore()
+                    print(f"[web] memory: pgvector ({memory.count()} records)")
+                else:
+                    memory = MemoryStore()
+                    print(f"[web] memory: jsonl ({memory.count()} records)")
+            except Exception as e:
                 memory = None
+                print(f"[web] memory disabled: {e}")
             skills = SkillsRegistry()
 
             system = DEFAULT_SYSTEM
@@ -377,8 +391,37 @@ async def delete_session(name: str):
 async def list_memories():
     agent: WebAgent = app.state.agent
     if agent.memory is None:
-        return {"enabled": False, "memories": []}
-    return {"enabled": True, "memories": agent.memory.all()}
+        return {"enabled": False, "backend": None, "count": 0, "memories": []}
+    return {
+        "enabled": True,
+        "backend": type(agent.memory).__name__,
+        "count": agent.memory.count(),
+        "memories": agent.memory.all(),
+    }
+
+
+@app.get("/api/memories/search")
+async def search_memories(q: str, top_k: int = 5):
+    agent: WebAgent = app.state.agent
+    if agent.memory is None:
+        return {"enabled": False, "results": []}
+    if not q.strip():
+        return {"enabled": True, "results": []}
+    async with app.state.lock:
+        results = agent.memory.search(q, top_k=top_k)
+    return {"enabled": True, "results": results}
+
+
+@app.delete("/api/memories/{rec_id}")
+async def delete_memory(rec_id: str):
+    agent: WebAgent = app.state.agent
+    if agent.memory is None:
+        raise HTTPException(404, "memory disabled")
+    async with app.state.lock:
+        removed = agent.memory.delete(rec_id)
+    if not removed:
+        raise HTTPException(404, f"no memory '{rec_id}'")
+    return {"ok": True, "count": agent.memory.count()}
 
 
 @app.get("/api/skills")

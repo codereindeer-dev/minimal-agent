@@ -12,6 +12,9 @@ const sessionNameEl = document.getElementById("session-name");
 const sessionSaveBtn = document.getElementById("session-save");
 const memoryListEl = document.getElementById("memory-list");
 const memCountEl = document.getElementById("mem-count");
+const memBackendEl = document.getElementById("mem-backend");
+const memSearchEl = document.getElementById("mem-search");
+const memSearchBtn = document.getElementById("mem-search-btn");
 const skillListEl = document.getElementById("skill-list");
 const skillCountEl = document.getElementById("skill-count");
 const resetBtn = document.getElementById("btn-reset");
@@ -32,6 +35,7 @@ function scrollDownEl(el) {
 // ─── single-chat state ───────────────────────────────────────────────────────
 let activeAssistantBubble = null;
 const toolCards = new Map();
+let memTouched = false;  // set when a remember/recall tool fired this turn
 
 function clearChat() {
   chatEl.innerHTML = "";
@@ -177,6 +181,9 @@ async function send(text) {
         break;
       case "tool_end":
         fillToolResult(ev.tool_call_id, ev.result, ev.blocked, toolCards);
+        if (!ev.blocked && (ev.name === "remember" || ev.name === "recall")) {
+          memTouched = true;
+        }
         break;
       case "approval_request":
         addApprovalCard(ev.approval_id, ev.command);
@@ -197,6 +204,10 @@ async function send(text) {
         sendBtn.disabled = false;
         inputEl.focus();
         refreshState();
+        if (memTouched) {
+          memTouched = false;
+          refreshMemories({ highlight: true });
+        }
         break;
     }
   };
@@ -307,29 +318,100 @@ async function deleteSession(name) {
   refreshSessions();
 }
 
-async function refreshMemories() {
+const BACKEND_LABELS = { MemoryStore: "jsonl", PgVectorStore: "pgvector" };
+
+// Build one memory <li>. `score` (0–1) is rendered only for search results.
+function renderMemoryItem(m, { score = null, highlight = false } = {}) {
+  const li = document.createElement("li");
+  li.className = "sb-item sb-memory" + (highlight ? " sb-flash" : "");
+  const scoreHtml = score !== null
+    ? `<span class="sb-mem-score" title="cosine similarity">${score.toFixed(3)}</span>`
+    : "";
+  li.innerHTML =
+    `<div class="sb-mem-head">` +
+      `<span class="sb-mem-id"></span>` +
+      scoreHtml +
+      `<button class="sb-del" title="Forget this memory">✕</button>` +
+    `</div>` +
+    `<div class="sb-mem-text"></div>` +
+    `<div class="sb-mem-tags"></div>`;
+  li.querySelector(".sb-mem-id").textContent = `#${m.id}`;
+  li.querySelector(".sb-mem-text").textContent = m.text;
+  const tagsEl = li.querySelector(".sb-mem-tags");
+  if (m.tags && m.tags.length) {
+    for (const t of m.tags) {
+      const chip = document.createElement("span");
+      chip.className = "sb-tag";
+      chip.textContent = t;
+      tagsEl.appendChild(chip);
+    }
+  } else {
+    tagsEl.remove();
+  }
+  li.querySelector(".sb-del").addEventListener("click", () => deleteMemory(m.id));
+  return li;
+}
+
+async function refreshMemories({ highlight = false } = {}) {
   const r = await fetch("/api/memories");
-  const { enabled, memories } = await r.json();
+  const { enabled, backend, count, memories } = await r.json();
   memoryListEl.innerHTML = "";
   if (!enabled) {
     memCountEl.textContent = "(disabled)";
+    memBackendEl.textContent = "";
     return;
   }
-  memCountEl.textContent = `(${memories.length})`;
+  memCountEl.textContent = `(${count})`;
+  memBackendEl.textContent = BACKEND_LABELS[backend] || backend || "";
   if (!memories.length) {
     memoryListEl.innerHTML = `<li class="sb-empty">no memories yet</li>`;
     return;
   }
   for (const m of memories) {
-    const li = document.createElement("li");
-    li.className = "sb-item sb-memory";
-    const tags = m.tags && m.tags.length ? ` [${m.tags.join(",")}]` : "";
-    li.innerHTML = `<div class="sb-mem-id"></div><div class="sb-mem-text"></div>`;
-    li.querySelector(".sb-mem-id").textContent = `#${m.id}${tags}`;
-    li.querySelector(".sb-mem-text").textContent = m.text;
-    memoryListEl.appendChild(li);
+    memoryListEl.appendChild(renderMemoryItem(m, { highlight }));
   }
 }
+
+async function searchMemories() {
+  const q = memSearchEl.value.trim();
+  if (!q) {
+    refreshMemories();
+    return;
+  }
+  memSearchBtn.disabled = true;
+  try {
+    const r = await fetch(`/api/memories/search?q=${encodeURIComponent(q)}`);
+    const { enabled, results } = await r.json();
+    memoryListEl.innerHTML = "";
+    if (!enabled) {
+      memoryListEl.innerHTML = `<li class="sb-empty">memory disabled</li>`;
+      return;
+    }
+    if (!results.length) {
+      memoryListEl.innerHTML = `<li class="sb-empty">no matches</li>`;
+      return;
+    }
+    for (const m of results) {
+      memoryListEl.appendChild(renderMemoryItem(m, { score: m.score }));
+    }
+  } finally {
+    memSearchBtn.disabled = false;
+  }
+}
+
+async function deleteMemory(id) {
+  if (!confirm(`Forget memory #${id}?`)) return;
+  const r = await fetch(`/api/memories/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!r.ok) return;
+  // Re-run the active search if there's a query, else refresh the full list.
+  if (memSearchEl.value.trim()) searchMemories();
+  else refreshMemories();
+}
+
+memSearchBtn.addEventListener("click", searchMemories);
+memSearchEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); searchMemories(); }
+});
 
 async function refreshSkills() {
   const r = await fetch("/api/skills");

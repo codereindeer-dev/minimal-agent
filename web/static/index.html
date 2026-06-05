@@ -31,7 +31,14 @@
       </section>
 
       <section class="sb-section">
-        <div class="sb-title">Memories <span id="mem-count" class="sb-count"></span></div>
+        <div class="sb-title">
+          Memories <span id="mem-count" class="sb-count"></span>
+          <span id="mem-backend" class="sb-badge" title="Active memory backend (read-only)"></span>
+        </div>
+        <div class="sb-actions">
+          <input id="mem-search" type="text" placeholder="semantic search…" maxlength="120">
+          <button id="mem-search-btn">Search</button>
+        </div>
         <ul id="memory-list" class="sb-list"></ul>
       </section>
 

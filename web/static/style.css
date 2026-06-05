@@ -206,6 +206,82 @@ body {
   font-size: 0.75rem;
 }
 
+/* read-only backend badge next to the Memories title */
+.sb-badge {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--accent);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  margin-left: auto;
+}
+
+.sb-badge:empty { display: none; }
+
+.sb-mem-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* id grows so score + ✕ stay pinned to the right, never squeezed */
+.sb-mem-head .sb-mem-id {
+  flex: 1;
+  min-width: 0;
+}
+
+.sb-mem-score {
+  flex-shrink: 0;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+  color: var(--green);
+}
+
+/* borderless ✕, only colours on hover — quieter than the bordered button */
+.sb-memory .sb-del {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 0.2rem;
+  line-height: 1;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.sb-memory .sb-del:hover { color: var(--error); }
+
+/* tags on their own line as muted chips, instead of a long [a,b,c] string */
+.sb-mem-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.35rem;
+}
+
+.sb-tag {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.65rem;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.02rem 0.3rem;
+}
+
+/* flash a memory item when remember/recall just touched the store */
+.sb-flash { animation: sb-flash-fade 1.6s ease-out; }
+
+@keyframes sb-flash-fade {
+  0%   { background: var(--warn-bg); }
+  100% { background: var(--panel-2); }
+}
+
 .sb-mem-text, .sb-sk-desc {
   color: var(--text);
   font-size: 0.78rem;
