@@ -17,7 +17,7 @@ One file (`minimal_agent.py`) does all this:
 - Hooks up an MCP server (`mcp-server-fetch`), mixes its tools with the native ones for the model
 - Conversation persistence (JSON-serialized, resumable across sessions, loadable across providers)
 - Context management: token counting, auto-trim (rolling summary), manual `/compact`
-- Long-term memory: Voyage AI embedding + JSONL append-only + cosine similarity retrieval
+- Long-term memory: Voyage AI embedding, swappable backend — JSONL append-only + in-memory cosine (default), or Postgres/pgvector with an HNSW index (`--memory pgvector`)
 - Sub-agent delegation: `spawn_agent` tool, depth limit ≤ 2, context isolation (provider auto-inherited)
 - 7 lifecycle events for external hooks to register (`user_message`, `pre/post_turn`, `text_chunk`, `pre/post_tool`, `assistant_message`)
 - Skills (`skills/<name>/SKILL.md`): scanned at startup, only name+description injected into the system prompt; the model decides when to `load_skill` to pull the full instructions
@@ -32,6 +32,8 @@ pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
 pip install openai tiktoken
 # For the Web UI, also:
 pip install fastapi uvicorn
+# For the pgvector memory backend, also:
+pip install "psycopg[binary]"
 ```
 
 Create `.env`:
@@ -40,6 +42,7 @@ Create `.env`:
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...     # only needed with --provider openai
 VOYAGE_API_KEY=...        # only needed for remember / recall
+DATABASE_URL=postgresql://user:pass@host/db   # only needed with --memory pgvector
 ```
 
 Run (default Anthropic):
@@ -83,6 +86,8 @@ claude> 5 items: ...
 | `--approval {auto,ask,safe}` | `run_shell` approval mode: full auto / ask every time / read-only allowlist auto |
 | `--yolo` | Shortcut for `--approval auto` |
 | `--trace` | Print every lifecycle event (hooks demo / debug) |
+| `--memory {jsonl,pgvector}` | Long-term memory backend: JSONL + in-memory cosine (default) or Postgres/pgvector + HNSW index |
+| `--pg-dsn <dsn>` | Postgres DSN for `--memory pgvector` (default: `DATABASE_URL` env var) |
 
 ---
 
@@ -120,10 +125,21 @@ python group_chat.py "Write a Python fib(n) function plus a quick test."
 
 Optional browser interface built on top of `minimal_agent.py`. FastAPI + native HTML/JS (no React, no build step).
 
+- Token-by-token streaming chat, with a thinking indicator while the first turn runs
+- Tool-call cards + `run_shell` approval buttons
+- Sidebar: sessions, skills, token meter, provider/model hot-swap
+- Memory panel: semantic search with similarity scores, per-item delete, live refresh + highlight when `remember`/`recall` fire, and a read-only badge showing the active backend + record count
+
 ```bash
 pip install fastapi uvicorn
 uvicorn web.server:app --reload
 # open http://localhost:8000
+```
+
+The memory backend is selected at boot via the `AGENT_MEMORY` env var (`jsonl` default, or `pgvector` — the latter also needs `DATABASE_URL`):
+
+```bash
+AGENT_MEMORY=pgvector uvicorn web.server:app --reload
 ```
 
 ---
@@ -169,6 +185,8 @@ How to read the codebase: `git checkout c1e9a04` for the simplest version (~80 l
 | `d7ee5e7` | Web UI commit 3: tool call cards + `run_shell` approval flow (`pre_tool` / `post_tool` hooks → tool_start / tool_end SSE events; `WebAgent` overrides `_approve_run_shell` → SSE + Future + `POST /api/approve` buttons) |
 | `8586f56` | Web UI commit 4: sidebar (sessions / memories / skills lists) + token meter + Reset / Compact buttons + REPL-command-to-endpoint parity (`GET /api/state`, `POST /api/reset|compact`, `/api/sessions` CRUD, `GET /api/memories|skills`) |
 | `4dc6c9e` | Web UI commit 5: provider/model hot-swap dropdown (`GET /api/providers`, `POST /api/provider`); canonical message format lets you switch Anthropic ↔ OpenAI mid-conversation without losing history. |
+| `ff0741d` | pgvector memory backend (`--memory pgvector` / `--pg-dsn`): `PgVectorStore` is a drop-in for `MemoryStore` — embeddings in a `vector(512)` column, HNSW cosine index, `<=>` nearest-neighbour search via the same `add` / `search` / `all` interface, so the agent can't tell which store is underneath |
+| `1d22945` | Web UI commit 6: memory panel (semantic search box with similarity scores, per-item delete, live refresh + flash highlight on `remember` / `recall`, read-only backend badge; `GET /api/memories/search`, `DELETE /api/memories/{id}`, `AGENT_MEMORY` backend selection, auto-reconnect for serverless Postgres). Plus UX follow-ups: search spinner, friendly embed-error surfacing, thinking indicator |
 
 ---
 

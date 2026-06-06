@@ -17,7 +17,7 @@
 - 接 MCP server（`mcp-server-fetch`），把它的工具跟原生工具混在一起讓模型用
 - 對話持久化（JSON 序列化、跨 session 接續，跨 provider 也能 load）
 - Context 管理：token 計算、自動 trim（rolling summary）、手動 `/compact`
-- 長期記憶：Voyage AI embedding + JSONL append-only + cosine 相似度檢索
+- 長期記憶：Voyage AI embedding，可換後端 — JSONL append-only + 記憶體內 cosine（預設），或 Postgres/pgvector + HNSW 索引（`--memory pgvector`）
 - 子 agent 委派：`spawn_agent` 工具、depth 限制 ≤ 2、context 隔離（自動繼承 provider）
 - 7 個生命週期事件給外部 hook 註冊（`user_message`、`pre/post_turn`、`text_chunk`、`pre/post_tool`、`assistant_message`）
 - Skills（`skills/<name>/SKILL.md`）：啟動時掃描，只把 name+description 注入 system prompt，模型自己決定何時 `load_skill` 載入完整指令
@@ -32,6 +32,8 @@ pip install anthropic python-dotenv mcp mcp-server-fetch voyageai
 pip install openai tiktoken
 # 想開 Web UI 再裝這兩個：
 pip install fastapi uvicorn
+# 想用 pgvector 記憶後端再裝：
+pip install "psycopg[binary]"
 ```
 
 建立 `.env`：
@@ -40,6 +42,7 @@ pip install fastapi uvicorn
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...     # 只有 --provider openai 才需要
 VOYAGE_API_KEY=...        # 只有 remember / recall 需要
+DATABASE_URL=postgresql://user:pass@host/db   # 只有 --memory pgvector 才需要
 ```
 
 跑（預設 Anthropic）：
@@ -83,6 +86,8 @@ claude> 目錄裡有 5 個項目：...
 | `--approval {auto,ask,safe}` | `run_shell` 批准模式：全自動 / 每次問 / 唯讀白名單自動 |
 | `--yolo` | `--approval auto` 的捷徑 |
 | `--trace` | 把所有 lifecycle 事件印出來（hooks demo / debug） |
+| `--memory {jsonl,pgvector}` | 長期記憶後端：JSONL + 記憶體內 cosine（預設）或 Postgres/pgvector + HNSW 索引 |
+| `--pg-dsn <dsn>` | `--memory pgvector` 用的 Postgres DSN（預設讀 `DATABASE_URL` 環境變數）|
 
 ---
 
@@ -120,10 +125,21 @@ python group_chat.py "Write a Python fib(n) function plus a quick test."
 
 建在 `minimal_agent.py` 之上的可選瀏覽器介面。FastAPI + 原生 HTML/JS（沒有 React、沒有 build step）。
 
+- Token-by-token 串流對話，第一輪跑的時候顯示 thinking 指示器
+- 工具呼叫卡片 + `run_shell` 批准按鈕
+- Sidebar：sessions、skills、token meter、provider/model 熱切換
+- 記憶面板：語意搜尋（附相似度分數）、逐筆刪除、`remember`/`recall` 觸發時即時刷新並高亮、唯讀 badge 顯示目前後端 + 記錄數
+
 ```bash
 pip install fastapi uvicorn
 uvicorn web.server:app --reload
 # 開 http://localhost:8000
+```
+
+記憶後端在啟動時由 `AGENT_MEMORY` 環境變數決定（預設 `jsonl`，或 `pgvector`——後者還需要 `DATABASE_URL`）：
+
+```bash
+AGENT_MEMORY=pgvector uvicorn web.server:app --reload
 ```
 
 ---
@@ -169,6 +185,8 @@ README.zh-TW.md     # 你正在讀這個（中文版）
 | `d7ee5e7` | Web UI commit 3：工具呼叫卡片 + `run_shell` approval flow（`pre_tool` / `post_tool` hooks → tool_start / tool_end SSE 事件；`WebAgent` 覆寫 `_approve_run_shell` → SSE + Future + `POST /api/approve` 按鈕）|
 | `8586f56` | Web UI commit 4：sidebar（sessions / memories / skills 列表）+ token meter + Reset / Compact 按鈕 + REPL 指令端點對應（`GET /api/state`、`POST /api/reset|compact`、`/api/sessions` CRUD、`GET /api/memories|skills`） |
 | `4dc6c9e` | Web UI commit 5：provider/model 熱切換下拉（`GET /api/providers`、`POST /api/provider`）；canonical message format 讓中途切換 Anthropic ↔ OpenAI 不破壞對話歷史。|
+| `ff0741d` | pgvector 記憶後端（`--memory pgvector` / `--pg-dsn`）：`PgVectorStore` 是 `MemoryStore` 的 drop-in——embedding 存進 `vector(512)` 欄位、HNSW cosine 索引、用 `<=>` 做最近鄰搜尋，透過同一套 `add` / `search` / `all` 介面，讓 agent 分不出底下是哪個 store |
+| `1d22945` | Web UI commit 6：記憶面板（語意搜尋框附相似度分數、逐筆刪除、`remember` / `recall` 觸發時即時刷新並高亮、唯讀後端 badge；`GET /api/memories/search`、`DELETE /api/memories/{id}`、`AGENT_MEMORY` 後端選擇、serverless Postgres 自動重連）。另含 UX 後續：搜尋 spinner、友善的 embedding 錯誤訊息、thinking 指示器 |
 
 ---
 
