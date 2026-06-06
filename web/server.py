@@ -407,8 +407,20 @@ async def search_memories(q: str, top_k: int = 5):
         return {"enabled": False, "results": []}
     if not q.strip():
         return {"enabled": True, "results": []}
-    async with app.state.lock:
-        results = agent.memory.search(q, top_k=top_k)
+    try:
+        async with app.state.lock:
+            results = agent.memory.search(q, top_k=top_k)
+    except Exception as e:
+        # The search embeds the query via Voyage AI, so the most common failure
+        # here is the embedding API (rate limit on the free tier, network, etc).
+        # Surface a short, actionable message instead of a raw 500 traceback.
+        name = type(e).__name__
+        if "RateLimit" in name or "rate limit" in str(e).lower():
+            detail = ("Embedding rate limit reached. Wait ~20s and retry, or add "
+                      "a payment method to your Voyage AI account to lift the free-tier cap.")
+        else:
+            detail = f"{name}: {e}"
+        raise HTTPException(502, detail)
     return {"enabled": True, "results": results}
 
 

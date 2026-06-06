@@ -179,6 +179,11 @@ body {
   to { transform: rotate(360deg); }
 }
 
+.sb-error {
+  color: var(--error);
+  font-style: normal;
+}
+
 .sb-item {
   display: flex;
   flex-direction: column;

@@ -382,6 +382,15 @@ async function searchMemories() {
   memoryListEl.innerHTML = `<li class="sb-empty sb-loading">searching…</li>`;
   try {
     const r = await fetch(`/api/memories/search?q=${encodeURIComponent(q)}`);
+    if (!r.ok) {
+      let detail = `search failed (HTTP ${r.status})`;
+      try {
+        const err = await r.json();
+        if (err && err.detail) detail = err.detail;
+      } catch (_) { /* non-JSON error body — keep the generic message */ }
+      showMemError(detail);
+      return;
+    }
     const { enabled, results } = await r.json();
     memoryListEl.innerHTML = "";
     if (!enabled) {
@@ -395,9 +404,21 @@ async function searchMemories() {
     for (const m of results) {
       memoryListEl.appendChild(renderMemoryItem(m, { score: m.score }));
     }
+  } catch (err) {
+    showMemError(`search error: ${err.message}`);
   } finally {
     memSearchBtn.disabled = false;
   }
+}
+
+function showMemError(message) {
+  // textContent (not innerHTML): the message echoes server-side exception text,
+  // which may include the user's query — never inject it as markup.
+  memoryListEl.innerHTML = "";
+  const li = document.createElement("li");
+  li.className = "sb-empty sb-error";
+  li.textContent = message;
+  memoryListEl.appendChild(li);
 }
 
 async function deleteMemory(id) {
