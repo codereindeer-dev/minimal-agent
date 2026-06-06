@@ -2,7 +2,9 @@
 
 # minimal-agent
 
-A from-scratch AI agent loop (single-file Python core) + two optional extensions: peer-to-peer multi-agent group chat, and a FastAPI + SSE browser Web UI. Swap LLM provider (Anthropic Claude / OpenAI GPT) + tool use / function calling + MCP + RAG long-term memory + sub-agent delegation + lifecycle hooks + skills. No LangChain, LlamaIndex, AutoGen, or similar frameworks.
+A from-scratch AI agent loop (single-file Python core), plus two optional extensions: peer-to-peer multi-agent group chat and a FastAPI + SSE browser Web UI.
+
+The core covers everything a real agent needs: swappable LLM provider (Anthropic Claude / OpenAI GPT), tool use / function calling, MCP, RAG long-term memory, sub-agent delegation, lifecycle hooks, and skills — no LangChain, LlamaIndex, AutoGen, or similar frameworks.
 
 ---
 

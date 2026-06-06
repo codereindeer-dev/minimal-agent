@@ -2,7 +2,9 @@
 
 # minimal-agent
 
-從零手寫的 AI agent loop（核心單檔 Python）+ 兩個可選擴充：peer-to-peer multi-agent group chat、以及 FastAPI + SSE 瀏覽器 Web UI。可換 LLM provider（Anthropic Claude / OpenAI GPT）+ tool use / function calling + MCP + RAG 長期記憶 + sub-agent 委派 + lifecycle hooks + skills。沒有 LangChain、LlamaIndex、AutoGen 之類的 framework。
+從零手寫的 AI agent loop（核心單檔 Python），外加兩個可選擴充：peer-to-peer multi-agent group chat，以及 FastAPI + SSE 瀏覽器 Web UI。
+
+核心涵蓋一個實用 agent 需要的一切：可換 LLM provider（Anthropic Claude / OpenAI GPT）、tool use / function calling、MCP、RAG 長期記憶、sub-agent 委派、lifecycle hooks、skills——沒有 LangChain、LlamaIndex、AutoGen 之類的 framework。
 
 ---
 
