@@ -379,6 +379,7 @@ async function searchMemories() {
     return;
   }
   memSearchBtn.disabled = true;
+  memoryListEl.innerHTML = `<li class="sb-empty sb-loading">searching…</li>`;
   try {
     const r = await fetch(`/api/memories/search?q=${encodeURIComponent(q)}`);
     const { enabled, results } = await r.json();

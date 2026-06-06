@@ -160,6 +160,25 @@ body {
   padding: 0.25rem 0;
 }
 
+.sb-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.sb-loading::before {
+  content: "";
+  width: 0.7rem;
+  height: 0.7rem;
+  flex-shrink: 0;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: sb-spin 0.6s linear infinite;
+}
+@keyframes sb-spin {
+  to { transform: rotate(360deg); }
+}
+
 .sb-item {
   display: flex;
   flex-direction: column;
