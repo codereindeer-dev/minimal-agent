@@ -29,10 +29,12 @@ Run:
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -57,6 +59,23 @@ from minimal_agent import (
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+class _DecodePathFilter(logging.Filter):
+    """uvicorn.access logs the raw percent-encoded request line, so a query
+    like ?q=%E6%88%91%E5%8F%AB... is unreadable. Decode the path in place
+    before the formatter runs, turning it back into the original characters
+    (e.g. Chinese search terms). args = (client, method, path, http_ver, status)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            client, method, path, http_version, status = args
+            record.args = (client, method, unquote(path), http_version, status)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_DecodePathFilter())
 
 
 def _messages_for_ui(messages: list) -> list[dict]:
