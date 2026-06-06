@@ -413,6 +413,25 @@ body {
 
 @keyframes blink { to { visibility: hidden; } }
 
+.bubble.assistant.thinking {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+}
+.bubble.assistant.thinking .dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: sb-bounce 1.2s ease-in-out infinite;
+}
+.bubble.assistant.thinking .dot:nth-child(2) { animation-delay: 0.2s; }
+.bubble.assistant.thinking .dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes sb-bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+  40% { transform: translateY(-0.25rem); opacity: 1; }
+}
+
 .bubble.error {
   color: var(--error);
   border-color: var(--error);

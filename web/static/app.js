@@ -36,6 +36,7 @@ function scrollDownEl(el) {
 let activeAssistantBubble = null;
 const toolCards = new Map();
 let memTouched = false;  // set when a remember/recall tool fired this turn
+let thinkingEl = null;   // typing indicator shown before the first event arrives
 
 function clearChat() {
   chatEl.innerHTML = "";
@@ -75,6 +76,22 @@ function finalizeAssistantBubble(finalText) {
   if (finalText !== undefined) activeAssistantBubble.textContent = finalText;
   if (!activeAssistantBubble.textContent) activeAssistantBubble.remove();
   activeAssistantBubble = null;
+}
+
+function showThinking() {
+  if (thinkingEl) return;
+  const div = document.createElement("div");
+  div.className = "bubble assistant thinking";
+  div.innerHTML = `<span class="dot"></span><span class="dot"></span><span class="dot"></span>`;
+  chatEl.appendChild(div);
+  thinkingEl = div;
+  scrollDownEl(chatEl);
+}
+
+function clearThinking() {
+  if (!thinkingEl) return;
+  thinkingEl.remove();
+  thinkingEl = null;
 }
 
 function addToolCard(parent, toolCallId, name, args, registry) {
@@ -145,6 +162,7 @@ function addApprovalCard(approvalId, command) {
 async function send(text) {
   addUserBubble(text);
   sendBtn.disabled = true;
+  showThinking();
 
   let requestId;
   try {
@@ -156,6 +174,7 @@ async function send(text) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     requestId = (await res.json()).request_id;
   } catch (e) {
+    clearThinking();
     const err = document.createElement("div");
     err.className = "bubble assistant error";
     err.textContent = "Error: " + e.message;
@@ -169,13 +188,16 @@ async function send(text) {
     const ev = JSON.parse(e.data);
     switch (ev.type) {
       case "text":
+        clearThinking();
         ensureAssistantBubble().textContent += ev.chunk;
         scrollDownEl(chatEl);
         break;
       case "assistant_done":
+        clearThinking();
         finalizeAssistantBubble(ev.text);
         break;
       case "tool_start":
+        clearThinking();
         finalizeAssistantBubble();
         addToolCard(chatEl, ev.tool_call_id, ev.name, ev.args, toolCards);
         break;
@@ -186,12 +208,14 @@ async function send(text) {
         }
         break;
       case "approval_request":
+        clearThinking();
         addApprovalCard(ev.approval_id, ev.command);
         break;
       case "usage":
         renderTokenMeter(ev.input);
         break;
       case "error": {
+        clearThinking();
         const b = ensureAssistantBubble();
         b.textContent = "Error: " + ev.message;
         b.classList.add("error");
@@ -199,6 +223,7 @@ async function send(text) {
         break;
       }
       case "done":
+        clearThinking();
         finalizeAssistantBubble();
         es.close();
         sendBtn.disabled = false;
@@ -213,6 +238,7 @@ async function send(text) {
   };
   es.onerror = () => {
     es.close();
+    clearThinking();
     finalizeAssistantBubble();
     sendBtn.disabled = false;
   };
