@@ -16,10 +16,16 @@ POST /api/approve               -> resolves a pending approval Future
 GET  /api/state                 -> provider, model, tokens, message history
 POST /api/reset | /api/compact
 GET  /api/sessions   POST /api/sessions/{save,load}   DELETE /api/sessions/{name}
-GET  /api/memories | /api/skills
+GET  /api/memories              -> {enabled, backend, count, memories}
+GET  /api/memories/search?q=&top_k=   -> semantic search with similarity scores
+DELETE /api/memories/{id}       -> forget one memory
+GET  /api/skills
 
 GET  /api/providers             -> list available providers
 POST /api/provider              -> hot-swap agent.provider + agent.model
+
+The memory backend is chosen at boot via the AGENT_MEMORY env var
+("jsonl" default, or "pgvector" — the latter also needs DATABASE_URL).
 
 Run:
     pip install fastapi uvicorn
